@@ -4,7 +4,7 @@ An MCP server for reading and writing Notion pages and databases from Claude Cod
 
 - **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
-- **Full read/write cycle** — read a page, make changes, apply them back. Supports 16 block types, inline formatting, and database CRUD.
+- **Broad block type coverage** — 16 block types, inline formatting, and database CRUD. Not universal yet (tables, synced blocks, and media are read-only).
 
 ## Prerequisites
 
