@@ -6,20 +6,15 @@ Uses **DNN (Dauphin Notion Notation)**, a compact text format that compresses No
 
 ## Setup
 
-### 1. Create a Notion integration
+### 1. Get a Notion API token
 
-1. Go to [notion.so/profile/integrations](https://www.notion.so/profile/integrations)
-2. Click **New integration**
-3. Give it a name, select your workspace, and set capabilities to **Read + Update + Insert content**
-4. Copy the token (starts with `ntn_`)
+Create an internal integration at [notion.so/profile/integrations](https://www.notion.so/profile/integrations). It needs **Read**, **Update**, and **Insert content** capabilities. You'll get a token starting with `ntn_`.
 
-### 2. Share pages with the integration
+Then share the pages/databases you want accessible: open each top-level page in Notion, go to **...** → **Connections**, and add your integration. Child pages inherit access.
 
-In Notion, open each page or database you want accessible, click **...** → **Connections** → add your integration. Child pages inherit access.
+### 2. Add to Claude Code
 
-### 3. Add to Claude Code
-
-Add this to your Claude Code MCP config (`~/.claude/settings.json` or project `.mcp.json`):
+Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 
 ```json
 {
@@ -38,14 +33,7 @@ Add this to your Claude Code MCP config (`~/.claude/settings.json` or project `.
 }
 ```
 
-### 4. Enable tools
-
-In Claude Code settings, enable the `notion-mcp` tools:
-- `notion_read` — read pages and databases
-- `notion_apply` — create, update, move, and delete content
-- `notion_search` — find pages and databases by title
-- `notion_check_auth` — verify the connection works
-- `notion_get_url` — get the Notion URL for a page or block
+Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply`, `notion_search`, `notion_check_auth`, and `notion_get_url`. Ask Claude to run `notion_check_auth` to verify the connection.
 
 ## What makes this different
 
