@@ -7,14 +7,12 @@ optimized for LLM manipulation.
 
 ## Operational Notes
 
-- **Current setup**: Token in `secrets/notion_token` (mode 600), loaded
-  directly at startup. Stdio transport launched by Claude Code.
+- **Token**: Passed via `--token-file <path>` CLI argument at startup.
+  Stdio transport launched by Claude Code.
 - **Auth model**: Internal integration tokens never expire (revoke-only).
-  Create at notion.so/my-integrations. Single workspace scope.
+  Create at notion.so/profile/integrations. Single workspace scope.
 - **No semantic search**: Self-hosted MCP lacks semantic search. Requires
   hosted MCP (`mcp.notion.com`) + Notion AI add-on for that feature.
-- **Status**: Phases 1-4 complete (DNN read/search/apply). Host-side keychain
-  integration planned to move token out of VM.
 
 ---
 
