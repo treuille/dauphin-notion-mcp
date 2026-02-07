@@ -4,7 +4,7 @@ Provides token-efficient Notion access via two tools:
 - notion.read: Read pages/databases in compact DNN format
 - notion.apply: Execute mutation scripts
 
-Credentials: Reads token from secrets/notion_token file.
+Token: Passed via --token-file <path> CLI argument at startup.
 """
 
 import asyncio

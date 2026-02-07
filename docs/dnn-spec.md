@@ -390,10 +390,6 @@ Read pages or databases.
 | `mode` | enum | `edit` | `edit`/`view` |
 | `depth` | int | 10 | Nesting depth |
 | `limit` | int | 50 | DB row limit |
-| `opaque` | enum | `collapse` | Block handling *(not yet implemented)* |
-| `filter` | string | null | DB filter DSL *(not yet implemented)* |
-| `sort` | string | null | DB sort *(not yet implemented)* |
-| `columns` | array | null | DB columns *(not yet implemented)* |
 
 **Returns for page:**
 ```
@@ -556,12 +552,6 @@ Notion's Append Block Children endpoint:
 - Can insert **after** a specific block via `after` parameter
 - **Cannot** insert before first child directly
 
-### `pos=start` Support *(not yet implemented)*
-
-If `+ parent=X pos=start` is requested and parent has children:
-- Without `allow_rewrite`: error `INSERT_BEFORE_FIRST`
-- With `allow_rewrite=true`: recreates all siblings (IDs change)
-
 ---
 
 ## Execution Semantics
@@ -601,8 +591,8 @@ This provides significant speedup over sequential execution.
 
 ### Rate Limiting
 
-A shared semaphore limits concurrent Notion API requests to 10. Notion's
-documented limit is 3 req/sec, but we use 10 since rate limiting hasn't
+A shared semaphore limits concurrent Notion API requests to 50. Notion's
+documented limit is 3 req/sec, but we use 50 since rate limiting hasn't
 been an issue in practice. Exponential backoff handles any 429 responses.
 
 ### Result Ordering
@@ -651,7 +641,6 @@ if you need sequential dependency between operations.
 | `TABS_IN_INDENT` | Tabs instead of spaces | Yes |
 | `MISSING_ID_SPACE` | `A1b2#` not `A1b2 #` | Yes |
 | `CODE_BLOCK_UNTERMINATED` | Missing ``` | Yes |
-| `INSERT_BEFORE_FIRST` | Need allow_rewrite | No |
 | `MULTI_DATASOURCE` | DB has multiple sources | No |
 | `MISSING_CAPABILITY` | Integration lacks permission | No |
 | `COPY_NOT_SUPPORTED` | Target type cannot be copied | No |
