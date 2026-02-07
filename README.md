@@ -1,6 +1,6 @@
 # dauphin-notion-mcp
 
-An MCP server for reading and writing Notion pages and databases from Claude Code.
+hou
 
 - **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
@@ -37,7 +37,7 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/adrienbrault/dauphin-notion-mcp",
+        "git+https://github.com/treuille/dauphin-notion-mcp",
         "dauphin-notion-mcp",
         "--token-file",
         "~/.config/dauphin-notion-mcp/token"
