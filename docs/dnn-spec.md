@@ -65,13 +65,13 @@ When a block line contains ` ``` `:
 - Subsequent lines are **raw content** (no ID, no marker parsing)
 - Code block **ends** at a line containing only ` ``` ` at same indent
 
-```
+````
 A1b2 ```python
 def greet(name):
     return f"Hello, {name}!"
 ```
 C3d4 Next block after code
-```
+````
 
 **Error**: `CODE_BLOCK_UNTERMINATED` if EOF reached without closing.
 
@@ -703,7 +703,7 @@ S9t0   [ ] Code
 
 ### Example 2: Code Block (Properly Closed)
 
-```
+````
 A1b2 ## Code Example
 C3d4 ```python
 def greet(name):
@@ -713,7 +713,7 @@ def greet(name):
 print("→ arrow in string")
 ```
 E5f6 The function above greets users.
-```
+````
 
 ### Example 3: Mixed Inline Formatting
 
@@ -768,7 +768,7 @@ K1l2,Slow query,Open,Medium
 
 ### Parsing State Machine
 
-```
+````
 START → HEADER
 HEADER: line matches ^@\w+ → stay HEADER
 HEADER: line matches ^[A-Za-z0-9]{4}\s → BLOCK
@@ -776,7 +776,7 @@ BLOCK: line contains ``` → CODE
 BLOCK: normal line → stay BLOCK
 CODE: line is ``` only → BLOCK
 CODE: any other line → stay CODE (raw)
-```
+````
 
 ### Read-Only Mode
 
