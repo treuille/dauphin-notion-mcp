@@ -2,7 +2,9 @@
 
 An MCP server for reading and writing Notion pages and databases from Claude Code.
 
-Uses **DNN (Dauphin Notion Notation)**, a compact text format that compresses Notion's JSON API by 87–92%, so Claude can read and edit large Notion workspaces without blowing through the context window.
+- **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
+- **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
+- **Full read/write cycle** — read a page, make changes, apply them back. Supports 16 block types, inline formatting, and database CRUD.
 
 ## Prerequisites
 
@@ -47,31 +49,27 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 
 Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply`, `notion_search`, `notion_check_auth`, and `notion_get_url`. Ask Claude to run `notion_check_auth` to verify the connection.
 
-## What makes this different
+## How it works
 
-**Token efficiency.** Notion's API returns deeply nested JSON — a typical page is 50–100KB. DNN compresses that to 2–5KB of readable text. This means Claude can work with much larger pages and databases without context window issues.
+The server uses **DNN (Dauphin Notion Notation)**, a compact text format designed for LLM consumption. Instead of passing Notion's raw JSON to Claude, DNN uses markdown-like syntax that's both human-readable and token-efficient.
 
-**Parallel operations.** Mutations (add, delete, move, update) execute concurrently with async rate limiting. Batch edits to a page with 20 blocks happen in parallel, not sequentially.
+### Supported block types
 
-**Full read/write cycle.** Read a page in DNN, edit the text, apply changes back. The format round-trips cleanly.
-
-## Supported block types
-
-| Type | DNN syntax | Read | Write |
-|:-----|:-----------|:-----|:------|
-| Paragraph | plain text | yes | yes |
-| Heading 1/2/3 | `#` `##` `###` | yes | yes |
-| Toggle heading | `>#` `>##` `>###` | yes | yes |
-| Bulleted list | `- item` | yes | yes |
-| Numbered list | `1. item` | yes | yes |
-| To-do | `[ ] task` / `[x] done` | yes | yes |
-| Toggle | `> content` | yes | yes |
-| Quote | `\| content` | yes | yes |
-| Callout | `! content` | yes | yes |
-| Divider | `---` | yes | yes |
-| Code block | ` ``` lang ` | yes | yes |
-| Child page | `§ Title` | yes | yes |
-| Child database | `⊞ Title` | yes | yes |
+| Type | DNN syntax |
+|:-----|:-----------|
+| Paragraph | plain text |
+| Heading 1/2/3 | `#` `##` `###` |
+| Toggle heading | `>#` `>##` `>###` |
+| Bulleted list | `- item` |
+| Numbered list | `1. item` |
+| To-do | `[ ] task` / `[x] done` |
+| Toggle | `> content` |
+| Quote | `\| content` |
+| Callout | `! content` |
+| Divider | `---` |
+| Code block | ` ``` lang ` |
+| Child page | `§ Title` |
+| Child database | `⊞ Title` |
 
 ### Inline formatting
 
@@ -83,19 +81,17 @@ Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply
 
 ### Databases
 
-Databases render as compact TSV (tab-separated) tables
-with typed columns. Supports:
-- Reading rows with optional filter, sort, and limit
-- Creating rows (`+row`)
-- Updating row properties (`urow`)
-- Deleting rows (`xrow`)
+Databases render as compact TSV tables with typed columns.
+Supports reading rows (with filter, sort, limit), creating
+rows (`+row`), updating properties (`urow`), and deleting
+rows (`xrow`).
 
 ## Not yet supported
 
 - **Tables** — Notion tables (not databases) are read-only
 - **Synced blocks** — displayed as placeholder, can't create
-- **Images/video/files** — displayed as `!image`, `!video`,
-  etc.; can't be created via the API
+- **Images/video/files** — displayed as `!image` etc.; can't
+  be created via the API
 - **Column layouts** — read-only
 - **Block equations** — read-only (inline `$math$` works)
 - **Database schema changes** — can't add/rename properties
