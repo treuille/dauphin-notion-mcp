@@ -103,10 +103,10 @@ _notion_token: Optional[str] = None
 
 
 def _get_token() -> str:
-    """Get the Notion token (set via --token CLI arg)."""
+    """Get the Notion token (set via --token-file CLI arg)."""
     if _notion_token is None:
         raise RuntimeError(
-            "No Notion token. Pass --token <your_token> on the command line."
+            "No Notion token. Pass --token-file <path> on the command line."
         )
     return _notion_token
 
@@ -5185,9 +5185,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="Notion MCP Server")
     parser.add_argument(
-        "--token",
+        "--token-file",
         required=True,
-        help="Notion API integration token (starts with ntn_ or secret_)"
+        help="Path to file containing Notion API token"
     )
     parser.add_argument(
         "--http",
@@ -5203,8 +5203,15 @@ def main():
     )
 
     global _notion_token
-    _notion_token = args.token
-    logger.info("Notion token set via --token")
+    token_path = Path(args.token_file).expanduser()
+    if not token_path.exists():
+        logger.error(f"Token file not found: {token_path}")
+        raise SystemExit(1)
+    _notion_token = token_path.read_text().strip()
+    if not _notion_token:
+        logger.error("Token file is empty")
+        raise SystemExit(1)
+    logger.info(f"Notion token loaded from {token_path}")
 
     if args.http:
         # HTTP mode: standalone server with health/kill endpoints

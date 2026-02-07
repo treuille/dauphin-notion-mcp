@@ -12,7 +12,14 @@ Create an internal integration at [notion.so/profile/integrations](https://www.n
 
 Then share the pages/databases you want accessible: open each top-level page in Notion, go to **...** → **Connections**, and add your integration. Child pages inherit access.
 
-### 2. Add to Claude Code
+### 2. Save the token to a file
+
+```bash
+mkdir -p ~/.config/dauphin-notion-mcp
+echo "ntn_YOUR_TOKEN_HERE" > ~/.config/dauphin-notion-mcp/token
+```
+
+### 3. Add to Claude Code
 
 Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 
@@ -26,7 +33,8 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
         "--from",
         "git+https://github.com/adrienbrault/dauphin-notion-mcp",
         "dauphin-notion-mcp",
-        "--token", "ntn_YOUR_TOKEN_HERE"
+        "--token-file",
+        "~/.config/dauphin-notion-mcp/token"
       ]
     }
   }
