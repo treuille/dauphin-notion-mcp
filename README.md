@@ -4,6 +4,10 @@ An MCP server for reading and writing Notion pages and databases from Claude Cod
 
 Uses **DNN (Dauphin Notion Notation)**, a compact text format that compresses Notion's JSON API by 87–92%, so Claude can read and edit large Notion workspaces without blowing through the context window.
 
+## Prerequisites
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
+
 ## Setup
 
 ### 1. Get a Notion API token
