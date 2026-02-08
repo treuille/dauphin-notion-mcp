@@ -1,20 +1,6 @@
-# Notion MCP Server
+# DNN/1 — Dauphin Notion Notation, version 1
 
-DNN/1 — Dauphin Notion Notation, version 1
-
-Custom MCP server providing ultra-compact Notion page representation
-optimized for LLM manipulation.
-
-## Operational Notes
-
-- **Token**: Passed via `--token-file <path>` CLI argument at startup.
-  Stdio transport launched by Claude Code.
-- **Auth model**: Internal integration tokens never expire (revoke-only).
-  Create at notion.so/profile/integrations. Single workspace scope.
-- **No semantic search**: Self-hosted MCP lacks semantic search. Requires
-  hosted MCP (`mcp.notion.com`) + Notion AI add-on for that feature.
-
----
+Ultra-compact Notion page representation optimized for LLM manipulation.
 
 ## Problem: Notion API Verbosity
 
