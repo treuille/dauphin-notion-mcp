@@ -19,7 +19,11 @@ Everything Notion does well for humans, it does just as well for agents.
 
 ## Prerequisites
 
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (or another MCP client)
+- A [Notion](https://www.notion.so/) account with an API integration
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
+
+> **Note:** Only tested on Ubuntu so far.
 
 ## Setup
 
