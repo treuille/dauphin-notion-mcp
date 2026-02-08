@@ -1,14 +1,29 @@
 # dauphin-notion-mcp
 
-hou
+This MCP server gives Claude full read/write access to your Notion workspace.
 
 - **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
 - **Broad block type coverage** — 16 block types, inline formatting, and database CRUD. Not universal yet (tables, synced blocks, and media are read-only).
 
+### Why Notion for agents?
+
+Notion is one of the most flexible tools for structuring personal information — projects, contacts, preferences, notes. That same flexibility makes it equally powerful as agent memory:
+
+- **User preferences & context** — grounding data agents can reference across sessions
+- **Contacts & CRM** — structured databases agents can query and update
+- **Projects & tasks** — planning surfaces agents can read and write to
+- **Knowledge bases** — rich documents agents can search and synthesize
+
+Everything Notion does well for humans, it does just as well for agents.
+
 ## Prerequisites
 
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (or another MCP client)
+- A [Notion](https://www.notion.so/) account with an API integration
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
+
+> **Note:** Only tested on Ubuntu so far.
 
 ## Setup
 
