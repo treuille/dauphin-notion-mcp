@@ -1,6 +1,8 @@
 # dauphin-notion-mcp
 
-hou
+Notion is one of the most flexible tools for organizing your own information — projects, contacts, preferences, notes. That same flexibility makes it a natural fit for agent memory. Everything Notion does well for humans, it does just as well for agents.
+
+This MCP server gives Claude full read/write access to your Notion workspace.
 
 - **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
