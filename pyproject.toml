@@ -24,3 +24,6 @@ package = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--import-mode=importlib"]
+markers = [
+    "integration: marks tests as integration tests (require running server, credentials)",
+]

@@ -965,21 +965,58 @@ def notion_rich_text_to_dnn(rich_text: list[dict]) -> str:
             mention = item.get("mention", {})
             mention_type = mention.get("type")
             if mention_type == "user":
-                user_id = mention.get("user", {}).get("id", "")
-                parts.append(f"@user:{user_id}")
+                result = f"@user:{mention.get('user', {}).get('id', '')}"
             elif mention_type == "date":
                 date_info = mention.get("date", {})
                 start = date_info.get("start", "")
                 end = date_info.get("end")
-                if end:
-                    parts.append(f"@date:{start}→{end}")
-                else:
-                    parts.append(f"@date:{start}")
+                result = f"@date:{start}→{end}" if end else f"@date:{start}"
             elif mention_type == "page":
                 page_id = mention.get("page", {}).get("id", "")
-                # Use plain_text for the page title (Notion provides it)
                 page_title = item.get("plain_text", "page")
-                parts.append(f"[{page_title}](p:{page_id})")
+                result = f"[{page_title}](p:{page_id})"
+            elif mention_type == "database":
+                # Databases are pages in Notion's model — use page-link syntax
+                db_id = mention.get("database", {}).get("id", "")
+                db_title = item.get("plain_text", "database")
+                result = f"[{db_title}](p:{db_id})"
+            elif mention_type == "link_mention":
+                # Rich URL embed — render as standard link (preview card is lost)
+                url = mention.get("link_mention", {}).get("href", "")
+                title = item.get("plain_text", url)
+                result = f"[{title}]({url})" if url else (title or "")
+            elif mention_type == "link_preview":
+                # Integration-specific rich embed — render as link
+                url = mention.get("link_preview", {}).get("url", "")
+                title = item.get("plain_text", url)
+                result = f"[{title}]({url})" if url else (title or "")
+            elif mention_type == "template_mention":
+                # Dynamic template value (e.g., "today", "me") — plain text
+                result = item.get("plain_text", "")
+            else:
+                # Unknown mention type — use plain_text to avoid silent drops
+                result = item.get("plain_text", "")
+
+            # Apply annotations to mention output (same logic as text)
+            if result:
+                annotations = item.get("annotations", {})
+                if annotations.get("code"):
+                    result = f"`{result}`"
+                else:
+                    if annotations.get("bold"):
+                        result = f"**{result}**"
+                    if annotations.get("italic"):
+                        result = f"*{result}*"
+                    if annotations.get("strikethrough"):
+                        result = f"~~{result}~~"
+                    if annotations.get("underline"):
+                        result = f":u[{result}]"
+                    color = annotations.get("color", "default")
+                    if color and color != "default":
+                        color_dnn = color.replace("_", "-")
+                        result = f":{color_dnn}[{result}]"
+
+            parts.append(result)
             continue
 
         # Regular text
@@ -1774,6 +1811,599 @@ PROPERTY_TYPE_MAP = {
 }
 
 
+# =============================================================================
+# Filter DSL — Parser & Compiler
+# =============================================================================
+
+
+@dataclass
+class FilterAtom:
+    """Leaf node: Property operator Value."""
+    property: str
+    operator: str   # =, !=, ~, !~, <, >, <=, >=, ?, !?
+    value: str      # empty string for unary ops (?, !?)
+
+
+@dataclass
+class FilterCompound:
+    """Binary logic node: AND / OR over children."""
+    op: str                                    # "&" or "|"
+    children: list                             # list[FilterAtom | FilterCompound]
+
+
+# Union type alias for type hints
+FilterNode = FilterAtom | FilterCompound
+
+
+# -- Tokenizer ---------------------------------------------------------------
+
+# Token types
+_TK_LPAREN = "LPAREN"
+_TK_RPAREN = "RPAREN"
+_TK_AND = "AND"
+_TK_OR = "OR"
+_TK_OP = "OP"          # comparison operator
+_TK_WORD = "WORD"      # unquoted identifier or value
+_TK_QUOTED = "QUOTED"  # double-quoted string
+_TK_EOF = "EOF"
+
+# Operators recognised by the tokenizer, longest-first for greedy match
+_FILTER_OPS = ("!=", "!~", "!?", "<=", ">=", "=", "~", "<", ">", "?")
+
+
+class FilterParseError(Exception):
+    """Raised when the filter DSL cannot be parsed."""
+
+
+def _tokenize_filter(s: str) -> list[tuple[str, str]]:
+    """Tokenize a filter DSL string into (type, value) pairs."""
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    n = len(s)
+
+    while i < n:
+        # Skip whitespace
+        if s[i].isspace():
+            i += 1
+            continue
+
+        # Parentheses
+        if s[i] == "(":
+            tokens.append((_TK_LPAREN, "("))
+            i += 1
+            continue
+        if s[i] == ")":
+            tokens.append((_TK_RPAREN, ")"))
+            i += 1
+            continue
+
+        # Logic operators
+        if s[i] == "&":
+            tokens.append((_TK_AND, "&"))
+            i += 1
+            continue
+        if s[i] == "|":
+            tokens.append((_TK_OR, "|"))
+            i += 1
+            continue
+
+        # Quoted string (property name or value)
+        if s[i] == '"':
+            j = i + 1
+            parts: list[str] = []
+            while j < n:
+                if s[j] == "\\" and j + 1 < n:
+                    parts.append(s[j + 1])
+                    j += 2
+                elif s[j] == '"':
+                    break
+                else:
+                    parts.append(s[j])
+                    j += 1
+            if j >= n:
+                raise FilterParseError(f"Unterminated quoted string starting at position {i}")
+            tokens.append((_TK_QUOTED, "".join(parts)))
+            i = j + 1
+            continue
+
+        # Comparison operators (try longest match first)
+        matched_op = False
+        for op in _FILTER_OPS:
+            if s[i:i + len(op)] == op:
+                tokens.append((_TK_OP, op))
+                i += len(op)
+                matched_op = True
+                break
+        if matched_op:
+            continue
+
+        # Unquoted word (identifier or value)
+        j = i
+        while j < n and not s[j].isspace() and s[j] not in '()&|"':
+            # Stop if we hit an operator character that starts a valid op
+            # But only if it's not part of the word (e.g., don't split "foo!=bar")
+            is_op_start = False
+            for op in _FILTER_OPS:
+                if s[j:j + len(op)] == op:
+                    is_op_start = True
+                    break
+            if is_op_start:
+                break
+            j += 1
+        if j > i:
+            tokens.append((_TK_WORD, s[i:j]))
+            i = j
+        else:
+            raise FilterParseError(f"Unexpected character '{s[i]}' at position {i}")
+
+    tokens.append((_TK_EOF, ""))
+    return tokens
+
+
+# -- Recursive descent parser ------------------------------------------------
+
+class _FilterParser:
+    """Parse tokenized filter DSL into a FilterNode AST.
+
+    Grammar (& binds tighter than |):
+        expr     → and_expr ('|' and_expr)*
+        and_expr → atom ('&' atom)*
+        atom     → '(' expr ')' | predicate
+        predicate→ PROPERTY OP VALUE
+                  | PROPERTY '?' | PROPERTY '!?'
+    """
+
+    def __init__(self, tokens: list[tuple[str, str]]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def _peek(self) -> tuple[str, str]:
+        return self.tokens[self.pos]
+
+    def _advance(self) -> tuple[str, str]:
+        tok = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def _expect(self, tok_type: str) -> tuple[str, str]:
+        tok = self._peek()
+        if tok[0] != tok_type:
+            raise FilterParseError(
+                f"Expected {tok_type}, got {tok[0]} ('{tok[1]}') at token {self.pos}"
+            )
+        return self._advance()
+
+    def parse(self) -> FilterNode:
+        node = self._parse_or()
+        if self._peek()[0] != _TK_EOF:
+            tok = self._peek()
+            raise FilterParseError(
+                f"Unexpected token {tok[0]} ('{tok[1]}') at position {self.pos}"
+            )
+        return node
+
+    def _parse_or(self) -> FilterNode:
+        left = self._parse_and()
+        children = [left]
+        while self._peek()[0] == _TK_OR:
+            self._advance()  # consume '|'
+            children.append(self._parse_and())
+        if len(children) == 1:
+            return children[0]
+        return FilterCompound(op="|", children=children)
+
+    def _parse_and(self) -> FilterNode:
+        left = self._parse_atom()
+        children = [left]
+        while self._peek()[0] == _TK_AND:
+            self._advance()  # consume '&'
+            children.append(self._parse_atom())
+        if len(children) == 1:
+            return children[0]
+        return FilterCompound(op="&", children=children)
+
+    def _parse_atom(self) -> FilterNode:
+        tok = self._peek()
+
+        # Parenthesized sub-expression
+        if tok[0] == _TK_LPAREN:
+            self._advance()  # consume '('
+            node = self._parse_or()
+            self._expect(_TK_RPAREN)
+            return node
+
+        # Predicate: property op value
+        # Property is WORD or QUOTED
+        if tok[0] not in (_TK_WORD, _TK_QUOTED):
+            raise FilterParseError(
+                f"Expected property name, got {tok[0]} ('{tok[1]}') at token {self.pos}"
+            )
+        prop_tok = self._advance()
+        prop_name = prop_tok[1]
+
+        # Operator
+        op_tok = self._peek()
+        if op_tok[0] != _TK_OP:
+            raise FilterParseError(
+                f"Expected operator after '{prop_name}', got {op_tok[0]} ('{op_tok[1]}') at token {self.pos}"
+            )
+        self._advance()
+        operator = op_tok[1]
+
+        # Unary operators (?, !?) have no value
+        if operator in ("?", "!?"):
+            return FilterAtom(property=prop_name, operator=operator, value="")
+
+        # Value is WORD or QUOTED
+        val_tok = self._peek()
+        if val_tok[0] not in (_TK_WORD, _TK_QUOTED):
+            raise FilterParseError(
+                f"Expected value after '{prop_name} {operator}', "
+                f"got {val_tok[0]} ('{val_tok[1]}') at token {self.pos}"
+            )
+        self._advance()
+        return FilterAtom(property=prop_name, operator=operator, value=val_tok[1])
+
+
+def parse_filter_dsl(s: str) -> FilterNode:
+    """Parse a filter DSL string into a FilterNode AST.
+
+    Args:
+        s: Filter string, e.g. 'Status = Done & Due < 2024-01-15'
+
+    Returns:
+        FilterNode (FilterAtom or FilterCompound)
+
+    Raises:
+        FilterParseError: On syntax errors.
+    """
+    tokens = _tokenize_filter(s)
+    parser = _FilterParser(tokens)
+    return parser.parse()
+
+
+# -- Schema-aware compiler ----------------------------------------------------
+
+# Operator → Notion condition name, keyed by DNN property type
+_OPERATOR_MAP: dict[str, dict[str, str]] = {
+    "title": {
+        "=": "equals", "!=": "does_not_equal",
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "rich_text": {
+        "=": "equals", "!=": "does_not_equal",
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "number": {
+        "=": "equals", "!=": "does_not_equal",
+        "<": "less_than", ">": "greater_than",
+        "<=": "less_than_or_equal_to", ">=": "greater_than_or_equal_to",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "select": {
+        "=": "equals", "!=": "does_not_equal",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "multi_select": {
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "status": {
+        "=": "equals", "!=": "does_not_equal",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "date": {
+        "=": "equals", "!=": "does_not_equal",
+        "<": "before", ">": "after",
+        "<=": "on_or_before", ">=": "on_or_after",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "checkbox": {
+        "=": "equals",
+    },
+    "url": {
+        "=": "equals", "!=": "does_not_equal",
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "email": {
+        "=": "equals", "!=": "does_not_equal",
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "phone_number": {
+        "=": "equals", "!=": "does_not_equal",
+        "~": "contains", "!~": "does_not_contain",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "created_time": {
+        "=": "equals", "!=": "does_not_equal",
+        "<": "before", ">": "after",
+        "<=": "on_or_before", ">=": "on_or_after",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+    "last_edited_time": {
+        "=": "equals", "!=": "does_not_equal",
+        "<": "before", ">": "after",
+        "<=": "on_or_before", ">=": "on_or_after",
+        "?": "is_empty", "!?": "is_not_empty",
+    },
+}
+
+
+def _find_property(schema: dict, name: str) -> tuple[str, str]:
+    """Find a property by name (case-insensitive) and return (canonical_name, notion_type).
+
+    Args:
+        schema: Data source object with 'properties' dict.
+        name: Property name to look up.
+
+    Returns:
+        (canonical_name, notion_type) e.g. ("Status", "select")
+
+    Raises:
+        FilterParseError: If property not found.
+    """
+    properties = schema.get("properties", {})
+    name_lower = name.lower()
+    for prop_name, prop_dict in properties.items():
+        if prop_name.lower() == name_lower:
+            return prop_name, prop_dict.get("type", "unknown")
+    available = sorted(properties.keys())
+    raise FilterParseError(
+        f"Unknown property '{name}'. Available: {', '.join(available)}"
+    )
+
+
+_RELATIVE_DATE_RE = re.compile(r'^-(\d+)d$')
+_ISO_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$')
+
+
+def _coerce_value(value: str, notion_type: str) -> object:
+    """Coerce a string value to the appropriate Python type for the Notion API.
+
+    Security: Every type branch must either return a validated value or raise
+    FilterParseError.  No raw user input may reach the Notion API unvalidated.
+
+    Args:
+        value: Raw string value from the DSL.
+        notion_type: Notion property type.
+
+    Returns:
+        Coerced value (str, int, float, bool).
+
+    Raises:
+        FilterParseError: If the value fails validation for its type.
+    """
+    if notion_type == "checkbox":
+        if value.lower() in ("1", "true", "yes"):
+            return True
+        if value.lower() in ("0", "false", "no"):
+            return False
+        raise FilterParseError(
+            f"Invalid checkbox value '{value}'. Use 1/0, true/false, or yes/no."
+        )
+    if notion_type == "number":
+        try:
+            if "." in value:
+                return float(value)
+            return int(value)
+        except ValueError:
+            raise FilterParseError(f"Invalid number value '{value}'.")
+    if notion_type in ("date", "created_time", "last_edited_time"):
+        m = _RELATIVE_DATE_RE.match(value)
+        if m:
+            from datetime import date, timedelta
+            days = int(m.group(1))
+            return (date.today() - timedelta(days=days)).isoformat()
+        if _ISO_DATE_RE.match(value):
+            return value
+        raise FilterParseError(
+            f"Invalid date value '{value}'. Use YYYY-MM-DD, "
+            f"YYYY-MM-DDTHH:MM, or -Nd (e.g. -14d)."
+        )
+    return value
+
+
+def _compile_atom(atom: FilterAtom, schema: dict) -> dict:
+    """Compile a single FilterAtom to a Notion API filter condition.
+
+    Args:
+        atom: Parsed filter atom.
+        schema: Data source object with 'properties' dict.
+
+    Returns:
+        Notion filter dict, e.g. {"property": "Status", "select": {"equals": "Done"}}
+
+    Raises:
+        FilterParseError: On unknown property or unsupported operator.
+    """
+    canonical_name, notion_type = _find_property(schema, atom.property)
+
+    # Find operator mapping for this type
+    type_ops = _OPERATOR_MAP.get(notion_type)
+    if type_ops is None:
+        raise FilterParseError(
+            f"Filtering not supported for property '{canonical_name}' (type: {notion_type})."
+        )
+
+    condition_name = type_ops.get(atom.operator)
+    if condition_name is None:
+        valid_ops = ", ".join(sorted(type_ops.keys()))
+        raise FilterParseError(
+            f"Operator '{atom.operator}' not valid for '{canonical_name}' "
+            f"(type: {notion_type}). Valid: {valid_ops}"
+        )
+
+    # Build the Notion filter condition
+    if atom.operator in ("?", "!?"):
+        # is_empty / is_not_empty — value is a boolean on the condition itself
+        return {
+            "property": canonical_name,
+            notion_type: {condition_name: True},
+        }
+
+    value = _coerce_value(atom.value, notion_type)
+    return {
+        "property": canonical_name,
+        notion_type: {condition_name: value},
+    }
+
+
+def compile_filter(node: FilterNode, schema: dict) -> dict:
+    """Compile a FilterNode AST into a Notion API filter object.
+
+    Args:
+        node: FilterNode from parse_filter_dsl().
+        schema: Data source object with 'properties' dict.
+
+    Returns:
+        Notion filter dict ready for query_data_source_async().
+
+    Raises:
+        FilterParseError: On compilation errors.
+    """
+    if isinstance(node, FilterAtom):
+        return _compile_atom(node, schema)
+
+    if isinstance(node, FilterCompound):
+        compiled_children = [compile_filter(child, schema) for child in node.children]
+        logic_key = "and" if node.op == "&" else "or"
+        return {logic_key: compiled_children}
+
+    raise FilterParseError(f"Unknown filter node type: {type(node)}")
+
+
+# -- Sort parser --------------------------------------------------------------
+
+def parse_sort_dsl(s: str, schema: dict) -> list[dict]:
+    """Parse compact sort DSL into Notion API sort objects.
+
+    Format: "Due desc, Status asc" or "Due desc" or '"Last Contact" desc'
+    Default direction is ascending.
+
+    Args:
+        s: Sort DSL string.
+        schema: Data source object with 'properties' dict.
+
+    Returns:
+        List of Notion sort objects.
+
+    Raises:
+        FilterParseError: On unknown property or invalid direction.
+    """
+    if not s.strip():
+        return []
+
+    sorts: list[dict] = []
+    # Split on commas, but respect quotes
+    specs = _split_sort_specs(s)
+
+    for spec in specs:
+        spec = spec.strip()
+        if not spec:
+            continue
+
+        # Parse property name (possibly quoted) and optional direction
+        prop_name, direction = _parse_sort_spec(spec)
+
+        canonical_name, _ = _find_property(schema, prop_name)
+        sorts.append({
+            "property": canonical_name,
+            "direction": direction,
+        })
+
+    return sorts
+
+
+def _split_sort_specs(s: str) -> list[str]:
+    """Split sort string on commas, respecting quoted property names."""
+    specs: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == '"':
+            in_quotes = not in_quotes
+            current.append(ch)
+        elif ch == "," and not in_quotes:
+            specs.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    if current:
+        specs.append("".join(current))
+    return specs
+
+
+def _parse_sort_spec(spec: str) -> tuple[str, str]:
+    """Parse a single sort spec into (property_name, direction).
+
+    Handles: 'Due desc', 'Due', '"Last Contact" desc', '"Last Contact"'
+    """
+    spec = spec.strip()
+    if spec.startswith('"'):
+        # Quoted property name
+        end_quote = spec.index('"', 1)
+        prop_name = spec[1:end_quote]
+        remainder = spec[end_quote + 1:].strip()
+    else:
+        parts = spec.split(None, 1)
+        prop_name = parts[0]
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+
+    if not remainder:
+        return prop_name, "ascending"
+
+    direction_lower = remainder.lower()
+    if direction_lower in ("asc", "ascending"):
+        return prop_name, "ascending"
+    if direction_lower in ("desc", "descending"):
+        return prop_name, "descending"
+
+    raise FilterParseError(
+        f"Invalid sort direction '{remainder}'. Use asc or desc."
+    )
+
+
+# -- Columns parser -----------------------------------------------------------
+
+def parse_columns_dsl(s: str, schema: dict) -> list[str]:
+    """Parse comma-separated column names, validated against schema.
+
+    Args:
+        s: Column names string, e.g. "Name, Status, Due".
+        schema: Data source object with 'properties' dict.
+
+    Returns:
+        List of canonical property names (order preserved, deduped).
+
+    Raises:
+        FilterParseError: On unknown column name.
+    """
+    if not s.strip():
+        return []  # empty means "all columns" (caller handles this)
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for col in s.split(","):
+        col = col.strip()
+        if not col:
+            continue
+
+        canonical_name, _ = _find_property(schema, col)
+        if canonical_name not in seen:
+            result.append(canonical_name)
+            seen.add(canonical_name)
+
+    return result
+
+
 def extract_property_value(prop: dict, registry: Optional[IdRegistry] = None) -> str:
     """Extract displayable value from a Notion property.
 
@@ -2161,6 +2791,14 @@ def render_page_to_dnn(
     else:
         lines.append(f"@page {page_id}")
 
+    icon = page.get("icon") or {}
+    if icon.get("type") == "emoji":
+        lines.append(f"@icon {icon['emoji']}")
+    elif icon.get("type") == "external":
+        url = icon.get("external", {}).get("url", "")
+        if url:
+            lines.append(f"@icon {url}")
+
     title = get_page_title(page)
     lines.append(f"@title {title}")
 
@@ -2278,7 +2916,7 @@ def render_database_to_dnn(
         else:
             col_defs.append(f"{name}({dnn_type})")
 
-    lines.append(f"@cols {','.join(col_defs)}")
+    lines.append(f"@cols (icon),{','.join(col_defs)}")
 
     # Row count with truncation indicator
     row_count = len(rows)
@@ -2295,11 +2933,16 @@ def render_database_to_dnn(
         row_id = row.get("id", "")
         row_props = row.get("properties", {})
 
+        icon = row.get("icon") or {}
+        icon_str = ""
+        if icon.get("type") == "emoji":
+            icon_str = icon.get("emoji", "")
+
         if mode == "edit":
             row_sid = registry.register(row_id)
-            cells = [row_sid]  # Row ID is always first, never needs quoting
+            cells = [icon_str, row_sid]  # icon, then row ID
         else:
-            cells = []
+            cells = [icon_str]
 
         for name in prop_names:
             if name in row_props:
@@ -2379,6 +3022,7 @@ MOVE_CMD_PATTERN = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)(?:\s+after=(\S+))
 # Patterns for detecting empty after= (common user error attempting to insert at beginning)
 ADD_CMD_EMPTY_AFTER = re.compile(r'^\+\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_EMPTY_AFTER = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)\s+after=\s*$')
+MOVE_CMD_MISSING_PARENT = re.compile(r'^m\s+(\S+)\s+->\s+after=(\S+)$')
 UPDATE_CMD_PATTERN = re.compile(r'^u\s+(\S+)\s+=\s+"(.*)"\s*$')
 TOGGLE_CMD_PATTERN = re.compile(r'^t\s+(\S+)\s+=\s+([01])$')
 
@@ -2496,6 +3140,22 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                 suggestions=[
                     "Remove 'after=' to move to end",
                     "Use 'after=BLOCK_ID' to move after specific block",
+                ]
+            ))
+            i += 1
+            continue
+
+        # Check for move missing parent= (common error: m X -> after=Y without parent=)
+        match = MOVE_CMD_MISSING_PARENT.match(line)
+        if match:
+            errors.append(DnnParseError(
+                code="MOVE_MISSING_PARENT",
+                message="Move requires parent=. To reposition within same parent, use: "
+                        "m SOURCE -> parent=PARENT after=SIBLING",
+                line=line_num,
+                excerpt=f"{line_num}|{line[:60]}",
+                suggestions=[
+                    f"m {match.group(1)} -> parent=??? after={match.group(2)}"
                 ]
             ))
             i += 1
@@ -2796,6 +3456,9 @@ HINTS = {
     "no_data_sources": "Unusual database state. Try opening in Notion UI first, or use the database's page URL.",
     "rate_limited": "Too many requests. Wait a moment and try again.",
     "invalid_token": "Token is invalid or expired. Check secrets/notion_token file.",
+    "db_params_on_page": "filter/sort/columns only work on databases. This ref resolved to a page or block.",
+    "filter_parse_error": "Filter syntax: Property op Value, joined with & (and) or | (or). Quote names with spaces: \"Last Contact\" >= 2024-01-01",
+    "db_params_batch": "filter/sort/columns require exactly one ref. Remove DB params or reduce to a single ref.",  # kept for backwards compat
 }
 
 
@@ -3481,6 +4144,180 @@ def _sanitize_block_for_write(
     return type_data, warnings
 
 
+async def _reupload_notion_file(file_obj: dict) -> tuple[dict, Optional[str]]:
+    """Re-upload a Notion-hosted file via the File Upload API.
+
+    Notion-hosted files use presigned S3 URLs that expire after 1 hour.
+    This downloads the file and re-uploads it via single_part mode to get
+    a permanent file_upload reference.
+
+    Args:
+        file_obj: File object from block type_data (e.g., image block's
+                  nested file object). Has shape {"type": "file"|"external"|
+                  "file_upload", ...}.
+
+    Returns:
+        Tuple of (new_file_obj, warning). new_file_obj uses file_upload
+        type if re-upload succeeded, or original if not needed/failed.
+        warning is set on failure or if URL was already permanent.
+    """
+    file_type = file_obj.get("type")
+
+    # External URLs don't expire — no re-upload needed
+    if file_type == "external":
+        return file_obj, None
+
+    # Already a file_upload reference — no re-upload needed
+    if file_type == "file_upload":
+        return file_obj, None
+
+    # Only process Notion-hosted files (type: "file")
+    if file_type != "file":
+        return file_obj, None
+
+    presigned_url = file_obj.get("file", {}).get("url", "")
+    if not presigned_url:
+        return file_obj, "file has no URL, skipping re-upload"
+
+    # Extract filename from URL path, or use default
+    from urllib.parse import urlparse
+    try:
+        path = urlparse(presigned_url).path
+        filename = path.split("/")[-1] if "/" in path else "file"
+        if not filename:
+            filename = "file"
+    except Exception:
+        filename = "file"
+
+    # Guess content_type from extension
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    content_type_map = {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp", "svg": "image/svg+xml",
+        "pdf": "application/pdf", "mp4": "video/mp4", "mov": "video/quicktime",
+    }
+    content_type = content_type_map.get(ext, "application/octet-stream")
+
+    try:
+        # Step 1: Download file from presigned URL
+        client = await _get_async_client()
+        download_resp = await client.get(presigned_url)
+        download_resp.raise_for_status()
+        file_bytes = download_resp.content
+
+        # Step 2: Create file upload (single_part mode)
+        upload_response = await _notion_request_async(
+            "POST",
+            "/file_uploads",
+            json_body={
+                "mode": "single_part",
+                "filename": filename,
+                "content_type": content_type,
+            }
+        )
+
+        upload_id = upload_response.get("id")
+        upload_url = upload_response.get("upload_url")
+        if not upload_id or not upload_url:
+            return file_obj, "file upload API returned no ID/URL, using expiring URL"
+
+        # Step 3: Upload binary via multipart form to the upload URL
+        token = _get_token()
+        upload_resp = await client.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Notion-Version": NOTION_VERSION,
+            },
+            files={"file": (filename, file_bytes, content_type)},
+        )
+        upload_resp.raise_for_status()
+
+        # Step 4: Poll until uploaded (with backoff, timeout ~30s)
+        max_polls = 10
+        for poll_attempt in range(max_polls):
+            await asyncio.sleep(min(1.0 * (1.5 ** poll_attempt), 5.0))
+            status_response = await _notion_request_async(
+                "GET",
+                f"/file_uploads/{upload_id}"
+            )
+            status = status_response.get("status")
+            if status == "uploaded":
+                return {
+                    "type": "file_upload",
+                    "file_upload": {"id": upload_id}
+                }, None
+            if status in ("failed", "expired"):
+                return file_obj, f"file re-upload {status}, using expiring URL"
+
+        return file_obj, "file re-upload timed out, using expiring URL"
+
+    except httpx.HTTPStatusError as e:
+        body = ""
+        if e.response is not None:
+            try:
+                body = e.response.text
+            except Exception:
+                pass
+        logger.warning(f"File re-upload failed: {e} body={body}")
+        return file_obj, f"file re-upload failed ({e.response.status_code if e.response else '?'}: {body or e}), using expiring URL"
+    except Exception as e:
+        logger.warning(f"File re-upload failed: {e}")
+        return file_obj, f"file re-upload failed ({e}), using expiring URL"
+
+
+# Block types that contain Notion-hosted file references
+FILE_BEARING_BLOCK_TYPES = {"image", "file", "video", "pdf"}
+
+# Block types that cannot be moved via clone+archive
+UNMOVABLE_BLOCK_TYPES = {
+    "synced_block": "Cannot move synced_block: sync relationship would be broken. "
+                    "Move the original content manually if you want an independent copy.",
+    "link_preview": "Cannot move link_preview: integration-specific embed cannot be "
+                    "recreated via API.",
+    "table": "Cannot move table: table structure requires matching row/column counts.",
+    "table_of_contents": "Cannot move table_of_contents: positional block with no "
+                         "portable content.",
+    "breadcrumb": "Cannot move breadcrumb: positional block with no portable content.",
+    "unsupported": "Cannot move unsupported block type.",
+}
+
+
+def _check_movability(source_block: dict) -> tuple[list[str], Optional[str]]:
+    """Pre-flight check for block movability.
+
+    Returns:
+        Tuple of (warnings, error). If error is set, the move should be
+        refused. Warnings are non-fatal notes about fidelity.
+    """
+    source_type = source_block.get("type", "")
+    warnings: list[str] = []
+
+    # Category C: Unmovable blocks
+    if source_type in UNMOVABLE_BLOCK_TYPES:
+        return [], UNMOVABLE_BLOCK_TYPES[source_type]
+
+    # Category B: File-bearing blocks (info about re-upload)
+    if source_type in FILE_BEARING_BLOCK_TYPES:
+        type_data = source_block.get(source_type, {})
+        if type_data.get("type") == "file":
+            warnings.append("File will be re-uploaded to preserve it")
+
+    # Scan rich_text for link_mention items
+    type_data = source_block.get(source_type, {})
+    for rt_item in type_data.get("rich_text", []):
+        if rt_item.get("type") == "mention":
+            mention = rt_item.get("mention", {})
+            if mention.get("type") == "link_mention":
+                warnings.append(
+                    "Block contains rich URL embeds that will be "
+                    "downgraded to plain links"
+                )
+                break  # One warning is enough
+
+    return warnings, None
+
+
 async def clone_block_with_children(
     block_id: str,
     max_depth: int = 10
@@ -3514,6 +4351,36 @@ async def clone_block_with_children(
     # Sanitize rich_text to handle malformed mentions
     type_data, block_warnings = _sanitize_block_for_write(block_type, type_data)
     warnings.extend(block_warnings)
+
+    # Re-upload Notion-hosted files to get permanent references
+    if block_type in FILE_BEARING_BLOCK_TYPES:
+        # File-bearing blocks store file info directly in type_data
+        # e.g., image block: type_data = {"type": "file", "file": {"url": "..."}}
+        file_obj = {
+            "type": type_data.get("type", ""),
+            type_data.get("type", ""): type_data.get(type_data.get("type", ""), {})
+        }
+        if file_obj.get("type") == "file":
+            new_file_obj, reupload_warning = await _reupload_notion_file(file_obj)
+            if reupload_warning:
+                warnings.append(reupload_warning)
+            old_type = type_data.get("type", "")
+            if new_file_obj.get("type") == "file_upload":
+                # Replace the file reference with the permanent upload
+                type_data.pop(old_type, None)
+                type_data["type"] = "file_upload"
+                type_data["file_upload"] = new_file_obj["file_upload"]
+            else:
+                # Fallback: convert to external URL (presigned, expires ~1h)
+                # Notion write API only accepts external or file_upload, not file
+                presigned_url = file_obj.get("file", {}).get("url", "")
+                if presigned_url:
+                    type_data.pop(old_type, None)
+                    type_data["type"] = "external"
+                    type_data["external"] = {"url": presigned_url}
+                    warnings.append("using expiring URL as external link (~1h)")
+                else:
+                    warnings.append("file has no URL, clone may fail")
 
     clone = {"type": block_type, block_type: type_data}
 
@@ -3905,9 +4772,14 @@ async def execute_apply_op(
                 if not is_valid:
                     return {}, err_msg
 
-            # Fetch source block to check type
+            # Fetch source block to check type and movability
             source_block = await _notion_request_async("GET", f"/blocks/{source_uuid}")
             source_type = source_block.get("type", "")
+
+            # Pre-flight movability check
+            move_warnings, move_error = _check_movability(source_block)
+            if move_error:
+                return {}, move_error
 
             # Check if it's a page-backed block (use page move instead)
             if source_type in ("child_page", "child_database"):
@@ -3939,8 +4811,9 @@ async def execute_apply_op(
                     move_result[op.source] = new_short
 
             result: dict = {"op": "m", "moved": move_result}
-            if clone_warnings:
-                result["warnings"] = clone_warnings
+            all_warnings = move_warnings + clone_warnings
+            if all_warnings:
+                result["warnings"] = all_warnings
             return result, None
 
         elif op.command == ApplyCommand.ADD_ROW:
@@ -4442,6 +5315,46 @@ def _detect_conflicts(ops: list[ApplyOp]) -> list[str]:
     return errors
 
 
+def _identify_move_chains(ops: list[ApplyOp]) -> list[list[int]]:
+    """Identify consecutive moves to the same parent needing sequential execution.
+
+    When multiple moves target the same parent without explicit after=,
+    parallel execution produces non-deterministic ordering. This function
+    finds runs of such moves so the executor can run them sequentially
+    and auto-chain each move after the previous one.
+
+    Returns list of chains, each a list of op indices (length >= 2).
+    Single moves and non-move ops are not included.
+    """
+    chains: list[list[int]] = []
+    current_chain: list[int] = []
+    current_parent: Optional[str] = None
+
+    for i, op in enumerate(ops):
+        is_chainable = (
+            op.command == ApplyCommand.MOVE
+            and op.dest_parent is not None
+            and op.dest_after is None
+        )
+
+        if is_chainable and op.dest_parent == current_parent:
+            current_chain.append(i)
+        else:
+            if len(current_chain) >= 2:
+                chains.append(current_chain)
+            if is_chainable:
+                current_chain = [i]
+                current_parent = op.dest_parent
+            else:
+                current_chain = []
+                current_parent = None
+
+    if len(current_chain) >= 2:
+        chains.append(current_chain)
+
+    return chains
+
+
 async def execute_apply_script(
     script: str,
     registry: IdRegistry,
@@ -4519,17 +5432,83 @@ async def execute_apply_script(
                      for op in parse_result.operations]
         )
 
-    # Execute ALL operations in parallel via asyncio.gather
-    # return_exceptions=True captures exceptions as results (not raised)
-    op_results = await asyncio.gather(
-        *[execute_apply_op(op, registry) for op in parse_result.operations],
-        return_exceptions=True
-    )
+    # Identify move chains: consecutive moves to the same parent without
+    # explicit after=. These must run sequentially to preserve script order.
+    ops = parse_result.operations
+    chains = _identify_move_chains(ops)
+    chained_indices = {idx for chain in chains for idx in chain}
 
-    # Process results in original line order (zip preserves order)
+    if not chains:
+        # Fast path: no chains, execute everything in parallel
+        op_results = await asyncio.gather(
+            *[execute_apply_op(op, registry) for op in ops],
+            return_exceptions=True
+        )
+    else:
+        # Mixed execution: parallel for independent ops, sequential for chains
+        op_results_arr: list[Any] = [None] * len(ops)
+
+        async def _run_move_chain(
+            chain_indices: list[int],
+        ) -> list[tuple[int, Any]]:
+            """Execute a move chain sequentially, auto-chaining after=."""
+            results: list[tuple[int, Any]] = []
+            prev_new_short: Optional[str] = None
+            for idx in chain_indices:
+                op = ops[idx]
+                # Inject after= from previous move's new block ID
+                if prev_new_short is not None:
+                    op.dest_after = prev_new_short
+                try:
+                    res = await execute_apply_op(op, registry)
+                    results.append((idx, res))
+                    op_result, error = res
+                    if not error and isinstance(op_result.get("moved"), dict):
+                        for _, new_id in op_result["moved"].items():
+                            prev_new_short = new_id
+                    # On error, keep prev_new_short — next move chains
+                    # after the last successfully moved block
+                except Exception as e:
+                    results.append((idx, e))
+                    # Keep prev_new_short as-is
+            return results
+
+        # Build coroutines: one per independent op, one per chain
+        parallel_coros = []
+        parallel_indices = []
+        for i, op in enumerate(ops):
+            if i not in chained_indices:
+                parallel_coros.append(execute_apply_op(op, registry))
+                parallel_indices.append(i)
+
+        chain_coros = [_run_move_chain(chain) for chain in chains]
+
+        # Run everything in parallel (chains are internally sequential)
+        all_results = await asyncio.gather(
+            *parallel_coros, *chain_coros,
+            return_exceptions=True
+        )
+
+        # Map parallel results back to their original indices
+        for i, idx in enumerate(parallel_indices):
+            op_results_arr[idx] = all_results[i]
+
+        # Map chain results back to their original indices
+        for i, chain in enumerate(chains):
+            chain_result = all_results[len(parallel_coros) + i]
+            if isinstance(chain_result, Exception):
+                for idx in chain:
+                    op_results_arr[idx] = chain_result
+            else:
+                for idx, res in chain_result:
+                    op_results_arr[idx] = res
+
+        op_results = op_results_arr
+
+    # Process results in original line order
     result = ApplyResult(ok=True)
 
-    for op, op_result_or_exc in zip(parse_result.operations, op_results):
+    for op, op_result_or_exc in zip(ops, op_results):
         # Handle exception case
         if isinstance(op_result_or_exc, Exception):
             result.ok = False
@@ -4598,12 +5577,17 @@ mcp = FastMCP("notion-mcp", host="127.0.0.1", port=2052)
 _id_registry = IdRegistry()
 
 
-async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
+async def _read_impl(
+    ref: str, mode: str, depth: int, limit: int,
+    filter_dsl: str = "", sort_dsl: str = "", columns_dsl: str = "",
+) -> str:
     """Core implementation for reading a Notion page/database/block.
 
     Returns DNN formatted content or an error string.
     """
     global _id_registry
+
+    has_db_params = bool(filter_dsl.strip() or sort_dsl.strip() or columns_dsl.strip())
 
     # Resolve reference to UUID
     object_id = _id_registry.resolve(ref)
@@ -4627,6 +5611,13 @@ async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
     try:
         page = await fetch_page_async(object_id)
         # Success - it's a page
+        if has_db_params:
+            return _error(
+                "DB_PARAMS_ON_PAGE",
+                "filter/sort/columns only apply to databases, but ref resolved to a page",
+                hint=HINTS["db_params_on_page"],
+                ref=ref
+            )
         blocks = await fetch_block_children_async(object_id, depth=depth)
         dnn = render_page_to_dnn(page, blocks, _id_registry, mode=mode)
         return dnn
@@ -4668,11 +5659,49 @@ async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
         if not data_source_id:
             return _error("INVALID_DATA_SOURCE", "Data source missing ID", ref=object_id)
 
-        # Step 2: Fetch schema and rows in parallel
-        data_source, (rows, has_more) = await asyncio.gather(
-            fetch_data_source_async(data_source_id),
-            query_data_source_async(data_source_id, limit=limit)
-        )
+        if has_db_params:
+            # Need schema first to compile filter/sort/columns
+            data_source = await fetch_data_source_async(data_source_id)
+
+            # Parse and compile filter
+            filter_obj = None
+            if filter_dsl.strip():
+                try:
+                    ast = parse_filter_dsl(filter_dsl)
+                    filter_obj = compile_filter(ast, data_source)
+                except FilterParseError as e:
+                    return _error(
+                        "FILTER_ERROR", str(e),
+                        hint=HINTS["filter_parse_error"], ref=filter_dsl
+                    )
+
+            # Parse sort
+            sorts = None
+            if sort_dsl.strip():
+                try:
+                    sorts = parse_sort_dsl(sort_dsl, data_source)
+                except FilterParseError as e:
+                    return _error("SORT_ERROR", str(e), ref=sort_dsl)
+
+            # Parse columns
+            columns_list: Optional[list[str]] = None
+            if columns_dsl.strip():
+                try:
+                    columns_list = parse_columns_dsl(columns_dsl, data_source)
+                except FilterParseError as e:
+                    return _error("COLUMNS_ERROR", str(e), ref=columns_dsl)
+
+            # Query with compiled params
+            rows, has_more = await query_data_source_async(
+                data_source_id, filter_obj=filter_obj, sorts=sorts, limit=limit
+            )
+        else:
+            # No DB params — fetch schema and rows in parallel (original fast path)
+            data_source, (rows, has_more) = await asyncio.gather(
+                fetch_data_source_async(data_source_id),
+                query_data_source_async(data_source_id, limit=limit)
+            )
+            columns_list = None
 
         # Merge database title into data_source for rendering
         # (database has the title, data_source has the properties)
@@ -4680,7 +5709,8 @@ async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
         data_source["database_id"] = object_id
 
         dnn = render_database_to_dnn(
-            data_source, rows, _id_registry, mode=mode, has_more=has_more
+            data_source, rows, _id_registry, mode=mode,
+            columns=columns_list, has_more=has_more
         )
         return dnn
 
@@ -4688,6 +5718,13 @@ async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
         if e.response is not None:
             if e.response.status_code == 404:
                 # Not a page or database - try as a block
+                if has_db_params:
+                    return _error(
+                        "DB_PARAMS_ON_PAGE",
+                        "filter/sort/columns only apply to databases, but ref resolved to a block",
+                        hint=HINTS["db_params_on_page"],
+                        ref=ref
+                    )
                 try:
                     block = await _notion_request_async("GET", f"/blocks/{object_id}")
                     # Success! Render this block (and children if any)
@@ -4727,24 +5764,43 @@ async def _read_impl(ref: str, mode: str, depth: int, limit: int) -> str:
 async def notion_read(
     pages: list[dict],
     depth: int = 10,
-    limit: int = 50
+    limit: int = 50,
+    filter: str = "",
+    sort: str = "",
+    columns: str = "",
 ) -> str:
-    """Read one or more Notion pages in parallel, in compact DNN format.
+    """Read Notion pages or databases in compact DNN format.
 
     Args:
-        pages: List of pages to read. Each entry has:
+        pages: List of pages/databases to read. Each entry has:
             - ref (required): short ID, full UUID, or Notion URL
             - mode (optional): "edit" (default) or "view"
-            Example: [{"ref": "abc123...", "mode": "edit"},
-                      {"ref": "def456...", "mode": "view"}]
-        depth: Maximum nesting depth per page (default 10)
-        limit: Maximum database rows per page (default 50)
+            - depth (optional): page nesting depth for this ref
+            - limit (optional): DB row limit for this ref
+            - filter (optional): DB filter DSL for this ref
+            - sort (optional): DB sort for this ref
+            - columns (optional): DB columns for this ref
+            Per-ref filter/sort/columns override the top-level defaults,
+            enabling batch reads that mix pages and filtered databases:
+            [{"ref": "page1"}, {"ref": "db1", "filter": "Status = Done", "columns": "Name, Status"}]
+        depth: Maximum nesting depth for pages (default 10)
+        limit: Maximum database rows (default 50)
+        filter: Database filter DSL (default for all refs).
+            Operators: = != ~ !~ < > <= >= ? !?
+            Logic: & (and), | (or), () grouping.
+            Quote names with spaces: "Last Contact" >= 2024-01-01
+        sort: Database sort (default for all refs).
+            E.g. 'Due desc, Status asc'. Default direction: ascending.
+        columns: Database columns (default for all refs).
+            Comma-separated (e.g. 'Name, Status, Due'). Empty = all columns.
 
     Returns:
         DNN formatted content. Multiple pages separated by ▤ headers.
+        Returns error if filter/sort/columns used on a non-database ref.
     """
-    # Parse page specs
-    specs: list[tuple[str, str]] = []
+    # Parse page specs — per-ref params override top-level defaults
+    specs: list[tuple[str, str, int, int, str, str, str]] = []
+    # (ref, mode, depth, limit, filter, sort, columns)
     for entry in pages:
         ref = entry.get("ref", "")
         if not ref:
@@ -4752,14 +5808,20 @@ async def notion_read(
         mode = entry.get("mode", "edit")
         if mode not in ("edit", "view"):
             mode = "edit"
-        specs.append((ref, mode))
+        ref_depth = entry.get("depth", depth)
+        ref_limit = entry.get("limit", limit)
+        ref_filter = entry.get("filter", filter)
+        ref_sort = entry.get("sort", sort)
+        ref_columns = entry.get("columns", columns)
+        specs.append((ref, mode, ref_depth, ref_limit, ref_filter, ref_sort, ref_columns))
 
     if not specs:
         return _error("EMPTY_BATCH", "No pages specified")
 
     # Read all pages in parallel
     results = await asyncio.gather(
-        *(_read_impl(ref, mode, depth, limit) for ref, mode in specs)
+        *(_read_impl(ref, mode, d, l, f, s, c)
+          for ref, mode, d, l, f, s, c in specs)
     )
 
     # Single page: return content directly (no header)
@@ -4769,7 +5831,7 @@ async def notion_read(
     # Multiple pages: format with ▤ headers
     total = len(specs)
     sections = []
-    for i, ((ref, mode), content) in enumerate(zip(specs, results), 1):
+    for i, ((ref, mode, *_rest), content) in enumerate(zip(specs, results), 1):
         sections.append(f"▤ [{i}/{total}] {ref} ({mode})\n{content}")
 
     return "\n\n".join(sections)
@@ -4975,7 +6037,8 @@ async def notion_apply(
     Block Commands:
         + parent=ID [after=ID]    Add blocks (indented content follows)
         x ID [ID2 ID3...]         Delete/archive blocks
-        m ID -> parent=ID [after=ID]  Move block (IDs change)
+        m ID -> parent=ID [after=ID]  Move block (parent= always required,
+                                       even for same-parent reposition)
         u ID = "text"             Update block text (can change type!)
         t ID = 0|1                Toggle todo checkbox
 
@@ -5069,6 +6132,13 @@ async def notion_apply(
             2. Configure settings
           [ ] Review :u[security] considerations
           [x] Initial setup complete
+
+    Moving Blocks:
+        Always use m to move blocks. Do not manually read → delete → add
+        — that round-trips through DNN and loses formatting/mentions.
+        m A1b2 -> parent=C3d4              Move to end of C3d4
+        m A1b2 -> parent=C3d4 after=E5f6   Move after E5f6
+        m A1b2 -> parent=SAME after=X      Reposition (same parent)
 
     Example - Batch operations:
         x Old1 Old2 Old3

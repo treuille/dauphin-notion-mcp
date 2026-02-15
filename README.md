@@ -6,16 +6,30 @@ This MCP server gives Claude full read/write access to your Notion workspace.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
 - **Broad block type coverage** — 16 block types, inline formatting, and database CRUD. Not universal yet (tables, synced blocks, and media are read-only).
 
-### Why Notion for agents?
+## How it works
 
-Notion is one of the most flexible tools for structuring personal information — projects, contacts, preferences, notes. That same flexibility makes it equally powerful as agent memory:
+Doesn't Notion basically feel like fancy markdown? Well, that's the entire idea here. When you read a Notion page through this server, you get back something that looks like this:
 
-- **User preferences & context** — grounding data agents can reference across sessions
-- **Contacts & CRM** — structured databases agents can query and update
-- **Projects & tasks** — planning surfaces agents can read and write to
-- **Knowledge bases** — rich documents agents can search and synthesize
+```
+R4kQ # Potential names for my cat
+t9Xm > Serious contenders
+pL3n   - **Gerald**
+vB8s     - Very distinguished
+J2wE   - **Margaret** :red[(vetoed @date:2026-02-14)]
+hA3z > Backups
+dR5v   - **Dr. Philip Hoffmann III**
+wU6j # Potential names for my newborn
+bT1y - :blue[Mr. Beans] (current frontrunner)
+xF4p   - Pros: already responds to it
+gN9s   - Cons: none
+kD2r - Mittens
+eP5m   - *Does this sound too much like a cat?*
+gI7N   - See @p:R4kQ
+```
 
-Everything Notion does well for humans, it does just as well for agents.
+There are many small differences from markdown — `>` is a toggle (foldable section), `:red[...]` is colored text ([following Streamlit](https://docs.streamlit.io/develop/api-reference/text/st.markdown)), `@p:R4kQ` is a page mention — but the format is designed to be immediately readable without learning anything new. For the full specification covering all block types, inline formatting, mutation commands, and error codes, see [docs/dnn-spec.md](docs/dnn-spec.md).
+
+One big departure from markdown is those four-character codes on the left (`R4kQ`, `t9Xm`, ...). Each one is a token-efficient reference to a Notion block. The MCP server manages these IDs across reads and writes so that edits target the correct blocks.
 
 ## Prerequisites
 
@@ -47,7 +61,7 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 ```json
 {
   "mcpServers": {
-    "notion-mcp": {
+    "dauphin-notion-mcp": {
       "type": "stdio",
       "command": "uvx",
       "args": [
@@ -64,43 +78,6 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 
 Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply`, `notion_search`, `notion_check_auth`, and `notion_get_url`. Ask Claude to run `notion_check_auth` to verify the connection.
 
-## How it works
-
-The server uses **DNN (Dauphin Notion Notation)**, a compact text format designed for LLM consumption. Instead of passing Notion's raw JSON to Claude, DNN uses markdown-like syntax that's both human-readable and token-efficient.
-
-### Supported block types
-
-| Type | DNN syntax |
-|:-----|:-----------|
-| Paragraph | plain text |
-| Heading 1/2/3 | `#` `##` `###` |
-| Toggle heading | `>#` `>##` `>###` |
-| Bulleted list | `- item` |
-| Numbered list | `1. item` |
-| To-do | `[ ] task` / `[x] done` |
-| Toggle | `> content` |
-| Quote | `\| content` |
-| Callout | `! content` |
-| Divider | `---` |
-| Code block | ` ``` lang ` |
-| Child page | `§ Title` |
-| Child database | `⊞ Title` |
-
-### Inline formatting
-
-`**bold**`, `*italic*`, `~~strike~~`, `` `code` ``,
-`:u[underline]`, `:red[colored text]`,
-`:yellow-background[highlighted]`,
-`[link text](url)`, `@p:ID` page mentions,
-`@date:2025-01-15` date mentions, `$E=mc^2$` equations.
-
-### Databases
-
-Databases render as compact TSV tables with typed columns.
-Supports reading rows (with filter, sort, limit), creating
-rows (`+row`), updating properties (`urow`), and deleting
-rows (`xrow`).
-
 ## Not yet supported
 
 - **Tables** — Notion tables (not databases) are read-only
@@ -111,11 +88,17 @@ rows (`xrow`).
 - **Block equations** — read-only (inline `$math$` works)
 - **Database schema changes** — can't add/rename properties
 
-## DNN format specification
+## Changelog
 
-See [docs/dnn-spec.md](docs/dnn-spec.md) for the full format
-specification including all block types, inline formatting,
-mutation commands, error codes, and examples.
+### 2026-02-14
+
+Major new features:
+
+- **Better searching and filtering over databases** — `notion_read` now accepts `filter`, `sort`, and `columns` parameters. The filter DSL supports comparison operators (`=`, `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=`), unary checks (`?` empty, `!?` not empty), boolean logic (`&`, `|`), parenthesized grouping, quoted property names, and relative dates (`-14d`). Sort takes compact specs like `Due desc, Status asc`. Columns selects which properties to return (`Name, Status, Due`). Schema-aware compilation validates property names and coerces types.
+- **Parallel reads** — each entry in the `pages` list can now override `depth`, `limit`, `filter`, `sort`, and `columns` independently, enabling batch reads that mix pages and filtered databases in a single call.
+- **More block type coverage** — database mentions, `link_mention` (rich URL embeds), `link_preview` (integration embeds), and `template_mention` types are now rendered instead of silently dropped. Annotations (bold, italic, color, etc.) are applied to mention output. Page and row icons (emoji or external URL) are included in DNN output.
+- **Better move semantics** — moving blocks that contain Notion-hosted files (images, videos, PDFs) now re-uploads the file via the File Upload API to get a permanent reference. Move commands pre-flight check whether a block can be moved, returning clear errors for synced blocks, tables, breadcrumbs, and other non-portable types. Consecutive moves to the same parent execute sequentially with auto-chaining to preserve script order. `m X -> after=Y` without `parent=` now returns a helpful error instead of silently failing.
+- **Renamed MCP config key** — the recommended key in `.mcp.json` / `settings.json` is now `dauphin-notion-mcp` (was `notion-mcp`), to avoid conflicts with other Notion MCP servers.
 
 ## License
 

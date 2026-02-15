@@ -1,5 +1,7 @@
 """Tests for notion_mcp module - ID system and DNN parser."""
 
+import asyncio
+
 import pytest
 from notion_mcp import (
     ApplyCommand,
@@ -9,25 +11,45 @@ from notion_mcp import (
     DnnHeader,
     DnnParseError,
     DnnParseResult,
+    FILE_BEARING_BLOCK_TYPES,
+    FilterAtom,
+    FilterCompound,
+    FilterParseError,
     IdRegistry,
     ParseState,
     RichTextSpan,
     SHORT_ID_PATTERN,
+    UNMOVABLE_BLOCK_TYPES,
     UUID_PATTERN,
     _build_property_value,
     _build_row_properties,
+    _check_movability,
+    _coerce_value,
     _detect_conflicts,
+    _identify_move_chains,
     _fetch_database_schema,
+    _find_property,
+    _notion_request,
     _parse_content_blocks,
+    _read_impl,
+    _reupload_notion_file,
     _text_to_rich_text,
+    _tokenize_filter,
     calculate_indent_level,
+    compile_filter,
     extract_uuid_from_url,
+    fetch_database_async,
+    fetch_data_source_async,
     generate_short_id,
     normalize_uuid,
+    notion_rich_text_to_dnn,
     parse_apply_script,
     parse_block_type,
+    parse_columns_dsl,
     parse_dnn,
+    parse_filter_dsl,
     parse_inline_formatting,
+    parse_sort_dsl,
     rich_text_spans_to_notion,
     strip_marker_for_block,
 )
@@ -1603,3 +1625,1357 @@ class TestTabIndentation:
         assert len(result.operations) == 1
         assert result.operations[0].icon == "💪"
         assert result.operations[0].row_values == {"Name": "Test", "Date": "2026-02-01"}
+
+
+# =============================================================================
+# Filter DSL Tests
+# =============================================================================
+
+# Helper: minimal schema for testing
+def _make_schema(**kwargs):
+    """Build a minimal schema dict. kwargs: name=type, e.g. Status="select"."""
+    properties = {}
+    for name, ptype in kwargs.items():
+        # Replace underscores with spaces for property names like "Last_Contact"
+        display_name = name.replace("_", " ") if "_" in name else name
+        properties[display_name] = {"type": ptype}
+    return {"properties": properties}
+
+
+SAMPLE_SCHEMA = _make_schema(
+    Title="title", Status="select", Due="date", Done="checkbox",
+    Priority="number", Tags="multi_select", Notes="rich_text",
+    Last_Contact="date", Last_Platform="select",
+)
+
+
+class TestFilterTokenizer:
+    """Tests for _tokenize_filter function."""
+
+    def test_simple_equality(self):
+        tokens = _tokenize_filter("Status = Done")
+        types = [t[0] for t in tokens]
+        assert types == ["WORD", "OP", "WORD", "EOF"]
+
+    def test_quoted_value(self):
+        tokens = _tokenize_filter('Status = "In Progress"')
+        assert tokens[2] == ("QUOTED", "In Progress")
+
+    def test_quoted_property(self):
+        tokens = _tokenize_filter('"Last Contact" >= 2026-02-01')
+        assert tokens[0] == ("QUOTED", "Last Contact")
+        assert tokens[1] == ("OP", ">=")
+
+    def test_and_or(self):
+        tokens = _tokenize_filter("A = 1 & B = 2 | C = 3")
+        types = [t[0] for t in tokens]
+        assert types == ["WORD", "OP", "WORD", "AND",
+                         "WORD", "OP", "WORD", "OR",
+                         "WORD", "OP", "WORD", "EOF"]
+
+    def test_parentheses(self):
+        tokens = _tokenize_filter("(A = 1 | B = 2) & C = 3")
+        types = [t[0] for t in tokens]
+        assert types == ["LPAREN", "WORD", "OP", "WORD", "OR",
+                         "WORD", "OP", "WORD", "RPAREN", "AND",
+                         "WORD", "OP", "WORD", "EOF"]
+
+    def test_unary_operators(self):
+        tokens = _tokenize_filter("Title ? & Notes !?")
+        ops = [t for t in tokens if t[0] == "OP"]
+        assert ops == [("OP", "?"), ("OP", "!?")]
+
+    def test_all_comparison_ops(self):
+        for op in ("=", "!=", "~", "!~", "<", ">", "<=", ">="):
+            tokens = _tokenize_filter(f"X {op} Y")
+            assert tokens[1] == ("OP", op), f"Failed for {op}"
+
+    def test_unterminated_quote_raises(self):
+        with pytest.raises(FilterParseError, match="Unterminated"):
+            _tokenize_filter('Status = "In Progress')
+
+    def test_escaped_quote_in_value(self):
+        tokens = _tokenize_filter(r'Title = "say \"hello\""')
+        assert tokens[2] == ("QUOTED", 'say "hello"')
+
+    def test_empty_string(self):
+        tokens = _tokenize_filter("")
+        assert tokens == [("EOF", "")]
+
+
+class TestFilterParser:
+    """Tests for parse_filter_dsl function."""
+
+    def test_simple_atom(self):
+        node = parse_filter_dsl("Status = Done")
+        assert isinstance(node, FilterAtom)
+        assert node.property == "Status"
+        assert node.operator == "="
+        assert node.value == "Done"
+
+    def test_quoted_property_and_value(self):
+        node = parse_filter_dsl('"Last Contact" = "In Progress"')
+        assert isinstance(node, FilterAtom)
+        assert node.property == "Last Contact"
+        assert node.value == "In Progress"
+
+    def test_and_chain(self):
+        node = parse_filter_dsl("A = 1 & B = 2 & C = 3")
+        assert isinstance(node, FilterCompound)
+        assert node.op == "&"
+        assert len(node.children) == 3
+
+    def test_or_chain(self):
+        node = parse_filter_dsl("A = 1 | B = 2 | C = 3")
+        assert isinstance(node, FilterCompound)
+        assert node.op == "|"
+        assert len(node.children) == 3
+
+    def test_and_binds_tighter_than_or(self):
+        # A = 1 | B = 2 & C = 3  →  A=1 | (B=2 & C=3)
+        node = parse_filter_dsl("A = 1 | B = 2 & C = 3")
+        assert isinstance(node, FilterCompound)
+        assert node.op == "|"
+        assert len(node.children) == 2
+        assert isinstance(node.children[0], FilterAtom)  # A = 1
+        assert isinstance(node.children[1], FilterCompound)  # B=2 & C=3
+        assert node.children[1].op == "&"
+
+    def test_parentheses_override_precedence(self):
+        # (A = 1 | B = 2) & C = 3
+        node = parse_filter_dsl("(A = 1 | B = 2) & C = 3")
+        assert isinstance(node, FilterCompound)
+        assert node.op == "&"
+        assert isinstance(node.children[0], FilterCompound)  # A=1 | B=2
+        assert node.children[0].op == "|"
+
+    def test_unary_is_empty(self):
+        node = parse_filter_dsl("Title ?")
+        assert isinstance(node, FilterAtom)
+        assert node.operator == "?"
+        assert node.value == ""
+
+    def test_unary_is_not_empty(self):
+        node = parse_filter_dsl("Title !?")
+        assert isinstance(node, FilterAtom)
+        assert node.operator == "!?"
+
+    def test_error_missing_operator(self):
+        with pytest.raises(FilterParseError, match="Expected operator"):
+            parse_filter_dsl("Status Done")
+
+    def test_error_missing_value(self):
+        with pytest.raises(FilterParseError, match="Expected value"):
+            parse_filter_dsl("Status = ")
+
+    def test_error_mismatched_paren(self):
+        with pytest.raises(FilterParseError):
+            parse_filter_dsl("(A = 1 | B = 2")
+
+    def test_error_empty_filter(self):
+        with pytest.raises(FilterParseError, match="Expected property"):
+            parse_filter_dsl("&")
+
+
+class TestFilterCompiler:
+    """Tests for compile_filter function."""
+
+    def test_text_contains(self):
+        node = parse_filter_dsl("Title ~ bug")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Title", "title": {"contains": "bug"}}
+
+    def test_select_equals(self):
+        node = parse_filter_dsl("Status = Done")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Status", "select": {"equals": "Done"}}
+
+    def test_date_before(self):
+        node = parse_filter_dsl("Due < 2024-01-15")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Due", "date": {"before": "2024-01-15"}}
+
+    def test_date_on_or_after(self):
+        node = parse_filter_dsl("Due >= 2024-01-15")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Due", "date": {"on_or_after": "2024-01-15"}}
+
+    def test_number_greater_than(self):
+        node = parse_filter_dsl("Priority > 3")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Priority", "number": {"greater_than": 3}}
+
+    def test_number_float(self):
+        node = parse_filter_dsl("Priority = 3.5")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Priority", "number": {"equals": 3.5}}
+
+    def test_checkbox_true(self):
+        node = parse_filter_dsl("Done = 1")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Done", "checkbox": {"equals": True}}
+
+    def test_checkbox_false(self):
+        node = parse_filter_dsl("Done = false")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Done", "checkbox": {"equals": False}}
+
+    def test_multi_select_contains(self):
+        node = parse_filter_dsl("Tags ~ urgent")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Tags", "multi_select": {"contains": "urgent"}}
+
+    def test_is_empty(self):
+        node = parse_filter_dsl("Notes ?")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Notes", "rich_text": {"is_empty": True}}
+
+    def test_is_not_empty(self):
+        node = parse_filter_dsl("Notes !?")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Notes", "rich_text": {"is_not_empty": True}}
+
+    def test_and_logic(self):
+        node = parse_filter_dsl("Status = Done & Due < 2024-01-15")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert "and" in result
+        assert len(result["and"]) == 2
+
+    def test_or_logic(self):
+        node = parse_filter_dsl("Status = Done | Status = Todo")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert "or" in result
+        assert len(result["or"]) == 2
+
+    def test_case_insensitive_property(self):
+        node = parse_filter_dsl("status = Done")
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        # Should resolve to canonical "Status"
+        assert result["property"] == "Status"
+
+    def test_quoted_property_with_space(self):
+        node = parse_filter_dsl('"Last Contact" >= 2026-02-01')
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        assert result == {"property": "Last Contact", "date": {"on_or_after": "2026-02-01"}}
+
+    def test_error_unknown_property(self):
+        node = parse_filter_dsl("Unknown = foo")
+        with pytest.raises(FilterParseError, match="Unknown property"):
+            compile_filter(node, SAMPLE_SCHEMA)
+
+    def test_error_unsupported_operator(self):
+        # select doesn't support ~
+        node = parse_filter_dsl("Status ~ Done")
+        with pytest.raises(FilterParseError, match="not valid"):
+            compile_filter(node, SAMPLE_SCHEMA)
+
+    def test_error_bad_checkbox_value(self):
+        with pytest.raises(FilterParseError, match="Invalid checkbox"):
+            _coerce_value("maybe", "checkbox")
+
+    def test_error_bad_number_value(self):
+        with pytest.raises(FilterParseError, match="Invalid number"):
+            _coerce_value("abc", "number")
+
+    def test_relative_date_days(self):
+        from datetime import date, timedelta
+        result = _coerce_value("-14d", "date")
+        expected = (date.today() - timedelta(days=14)).isoformat()
+        assert result == expected
+
+    def test_relative_date_in_filter(self):
+        from datetime import date, timedelta
+        node = parse_filter_dsl('"Last Contact" >= -7d')
+        result = compile_filter(node, SAMPLE_SCHEMA)
+        expected_date = (date.today() - timedelta(days=7)).isoformat()
+        assert result == {"property": "Last Contact", "date": {"on_or_after": expected_date}}
+
+    def test_relative_date_not_applied_to_text(self):
+        result = _coerce_value("-14d", "rich_text")
+        assert result == "-14d"
+
+    def test_iso_date_accepted(self):
+        assert _coerce_value("2026-01-25", "date") == "2026-01-25"
+
+    def test_iso_datetime_accepted(self):
+        assert _coerce_value("2026-01-25T14:30", "date") == "2026-01-25T14:30"
+
+    def test_iso_datetime_with_seconds_accepted(self):
+        assert _coerce_value("2026-01-25T14:30:00", "date") == "2026-01-25T14:30:00"
+
+    def test_invalid_date_rejected(self):
+        with pytest.raises(FilterParseError, match="Invalid date value"):
+            _coerce_value("yesterday", "date")
+
+    def test_garbage_date_rejected(self):
+        with pytest.raises(FilterParseError, match="Invalid date value"):
+            _coerce_value("not-a-date", "date")
+
+    def test_invalid_date_rejected_for_created_time(self):
+        with pytest.raises(FilterParseError, match="Invalid date value"):
+            _coerce_value("last week", "created_time")
+
+    def test_invalid_date_rejected_for_last_edited_time(self):
+        with pytest.raises(FilterParseError, match="Invalid date value"):
+            _coerce_value("abc", "last_edited_time")
+
+
+class TestSortParser:
+    """Tests for parse_sort_dsl function."""
+
+    def test_single_sort_desc(self):
+        result = parse_sort_dsl("Due desc", SAMPLE_SCHEMA)
+        assert result == [{"property": "Due", "direction": "descending"}]
+
+    def test_single_sort_asc(self):
+        result = parse_sort_dsl("Due asc", SAMPLE_SCHEMA)
+        assert result == [{"property": "Due", "direction": "ascending"}]
+
+    def test_default_direction(self):
+        result = parse_sort_dsl("Due", SAMPLE_SCHEMA)
+        assert result == [{"property": "Due", "direction": "ascending"}]
+
+    def test_multiple_sorts(self):
+        result = parse_sort_dsl("Due desc, Status asc", SAMPLE_SCHEMA)
+        assert len(result) == 2
+        assert result[0]["property"] == "Due"
+        assert result[0]["direction"] == "descending"
+        assert result[1]["property"] == "Status"
+        assert result[1]["direction"] == "ascending"
+
+    def test_quoted_property(self):
+        result = parse_sort_dsl('"Last Contact" desc', SAMPLE_SCHEMA)
+        assert result == [{"property": "Last Contact", "direction": "descending"}]
+
+    def test_case_insensitive(self):
+        result = parse_sort_dsl("due desc", SAMPLE_SCHEMA)
+        assert result[0]["property"] == "Due"
+
+    def test_empty_string(self):
+        result = parse_sort_dsl("", SAMPLE_SCHEMA)
+        assert result == []
+
+    def test_error_unknown_property(self):
+        with pytest.raises(FilterParseError, match="Unknown property"):
+            parse_sort_dsl("Unknown desc", SAMPLE_SCHEMA)
+
+    def test_error_invalid_direction(self):
+        with pytest.raises(FilterParseError, match="Invalid sort direction"):
+            parse_sort_dsl("Due sideways", SAMPLE_SCHEMA)
+
+
+class TestColumnsParser:
+    """Tests for parse_columns_dsl function."""
+
+    def test_single_column(self):
+        result = parse_columns_dsl("Title", SAMPLE_SCHEMA)
+        assert result == ["Title"]
+
+    def test_multiple_columns(self):
+        result = parse_columns_dsl("Title, Status, Due", SAMPLE_SCHEMA)
+        assert result == ["Title", "Status", "Due"]
+
+    def test_case_insensitive(self):
+        result = parse_columns_dsl("title, status", SAMPLE_SCHEMA)
+        assert result == ["Title", "Status"]
+
+    def test_with_spaces_in_name(self):
+        result = parse_columns_dsl("Title, Last Contact, Last Platform", SAMPLE_SCHEMA)
+        assert result == ["Title", "Last Contact", "Last Platform"]
+
+    def test_deduplication(self):
+        result = parse_columns_dsl("Title, Status, Title", SAMPLE_SCHEMA)
+        assert result == ["Title", "Status"]
+
+    def test_empty_string(self):
+        result = parse_columns_dsl("", SAMPLE_SCHEMA)
+        assert result == []
+
+    def test_whitespace_trimming(self):
+        result = parse_columns_dsl("  Title ,  Status  ", SAMPLE_SCHEMA)
+        assert result == ["Title", "Status"]
+
+    def test_error_unknown_column(self):
+        with pytest.raises(FilterParseError, match="Unknown property"):
+            parse_columns_dsl("Title, Nonexistent", SAMPLE_SCHEMA)
+
+
+# =============================================================================
+# Integration Tests — Live Notion API
+# =============================================================================
+
+# Test Playground page UUID (shared with integration)
+TEST_PLAYGROUND_ID = "2e7b94fa-2460-80e4-80f3-cba1f6fe0866"
+
+
+def _notion_available() -> bool:
+    """Check if Notion API is available (token exists and works)."""
+    try:
+        _notion_request("GET", "/users/me")
+        return True
+    except Exception:
+        return False
+
+
+def _create_test_database(parent_page_id: str, title: str) -> dict:
+    """Create a database under the test playground for integration tests.
+
+    In API 2025-09-03, properties are added via data_source PATCH,
+    not in the database creation call.
+
+    Returns the created database object (with data_sources).
+    """
+    # Step 1: Create database container with just the title property
+    db = _notion_request("POST", "/databases", json_body={
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": title}}],
+        "properties": {"Name": {"title": {}}},
+    })
+
+    # Step 2: Add remaining properties via data_source PATCH
+    ds_id = db["data_sources"][0]["id"]
+    _notion_request("PATCH", f"/data_sources/{ds_id}", json_body={
+        "properties": {
+            "Status": {
+                "select": {
+                    "options": [
+                        {"name": "Todo", "color": "gray"},
+                        {"name": "In Progress", "color": "blue"},
+                        {"name": "Done", "color": "green"},
+                    ]
+                }
+            },
+            "Priority": {"number": {}},
+            "Due": {"date": {}},
+            "Done": {"checkbox": {}},
+            "Notes": {"rich_text": {}},
+        },
+    })
+
+    return db
+
+
+def _add_test_row(database_id: str, name: str, **props) -> dict:
+    """Add a row to the test database."""
+    page_props: dict = {
+        "Name": {"title": [{"text": {"content": name}}]},
+    }
+    if "status" in props:
+        page_props["Status"] = {"select": {"name": props["status"]}}
+    if "priority" in props:
+        page_props["Priority"] = {"number": props["priority"]}
+    if "due" in props:
+        page_props["Due"] = {"date": {"start": props["due"]}}
+    if "done" in props:
+        page_props["Done"] = {"checkbox": props["done"]}
+    if "notes" in props:
+        page_props["Notes"] = {"rich_text": [{"text": {"content": props["notes"]}}]}
+
+    return _notion_request("POST", "/pages", json_body={
+        "parent": {"type": "database_id", "database_id": database_id},
+        "properties": page_props,
+    })
+
+
+def _archive_database(database_id: str) -> None:
+    """Archive (delete) a database."""
+    try:
+        _notion_request("PATCH", f"/blocks/{database_id}", json_body={"archived": True})
+    except Exception:
+        pass  # Best-effort cleanup
+
+
+@pytest.fixture(scope="module")
+def event_loop():
+    """Module-scoped event loop shared across all integration tests.
+
+    Using event_loop.run_until_complete() closes the loop after each call, which breaks
+    httpx async connections in subsequent tests. A shared loop avoids this.
+    """
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="module")
+def test_db():
+    """Create a test database with seed data, yield it, then archive."""
+    if not _notion_available():
+        pytest.skip("Notion API not available (no token or network)")
+
+    import time
+    title = f"FilterDSL Test {int(time.time())}"
+    db = _create_test_database(TEST_PLAYGROUND_ID, title)
+    db_id = db["id"]
+
+    # Seed rows
+    _add_test_row(db_id, "Fix login bug", status="Done", priority=3,
+                  due="2024-01-10", done=True, notes="Critical fix")
+    _add_test_row(db_id, "Add dark mode", status="In Progress", priority=2,
+                  due="2024-01-20", done=False, notes="Design ready")
+    _add_test_row(db_id, "Write docs", status="Todo", priority=1,
+                  due="2024-02-01", done=False)
+    _add_test_row(db_id, "Fix search bug", status="Done", priority=5,
+                  due="2024-01-05", done=True, notes="Quick fix")
+    _add_test_row(db_id, "Deploy v2", status="In Progress", priority=4,
+                  due="2024-01-15", done=False)
+
+    # Small delay for Notion to index
+    time.sleep(1)
+
+    yield {"id": db_id, "title": title}
+
+    # Teardown
+    _archive_database(db_id)
+
+
+@pytest.mark.integration
+class TestNotionReadDbE2E:
+    """End-to-end tests for notion_read with filter/sort/columns on live Notion API."""
+
+    def test_read_unfiltered(self, test_db, event_loop):
+        """Basic database read without filters returns all rows."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50)
+        )
+        assert "@dnn 1" in result
+        assert "@db " in result
+        assert "@cols " in result
+        assert "@rows 5" in result
+
+    def test_filter_select_equals(self, test_db, event_loop):
+        """Filter by select property."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Status = Done")
+        )
+        assert "@rows 2" in result
+        # Should contain both "Done" rows
+        assert "Fix login bug" in result
+        assert "Fix search bug" in result
+        # Should not contain non-Done rows
+        assert "Add dark mode" not in result
+
+    def test_filter_number_greater_than(self, test_db, event_loop):
+        """Filter by number comparison."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Priority > 3")
+        )
+        # Priority 4 and 5
+        assert "Fix search bug" in result
+        assert "Deploy v2" in result
+
+    def test_filter_date_before(self, test_db, event_loop):
+        """Filter by date before."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Due < 2024-01-15")
+        )
+        # Due before Jan 15: "Fix login bug" (Jan 10), "Fix search bug" (Jan 5)
+        assert "Fix login bug" in result
+        assert "Fix search bug" in result
+        assert "Add dark mode" not in result
+
+    def test_filter_checkbox(self, test_db, event_loop):
+        """Filter by checkbox."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Done = 1")
+        )
+        assert "@rows 2" in result
+
+    def test_filter_text_contains(self, test_db, event_loop):
+        """Filter by text contains."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Name ~ bug")
+        )
+        assert "Fix login bug" in result
+        assert "Fix search bug" in result
+        assert "Add dark mode" not in result
+
+    def test_filter_compound_and(self, test_db, event_loop):
+        """Compound AND filter."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Status = Done & Priority > 3")
+        )
+        # Only "Fix search bug" (Done, priority 5)
+        assert "@rows 1" in result
+        assert "Fix search bug" in result
+
+    def test_filter_compound_or(self, test_db, event_loop):
+        """Compound OR filter."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl='Status = Done | Status = "In Progress"')
+        )
+        # 2 Done + 2 In Progress = 4
+        assert "@rows 4" in result
+
+    def test_sort_desc(self, test_db, event_loop):
+        """Sort by priority descending."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        sort_dsl="Priority desc")
+        )
+        lines = result.strip().split("\n")
+        # Find data rows (after blank line following headers)
+        data_start = None
+        for i, line in enumerate(lines):
+            if line == "" and i > 0:
+                data_start = i + 1
+        assert data_start is not None
+        data_lines = [l for l in lines[data_start:] if l.strip()]
+        # First data row should have highest priority (5 = Fix search bug)
+        assert "Fix search bug" in data_lines[0]
+
+    def test_columns_selection(self, test_db, event_loop):
+        """Columns parameter limits which columns are shown."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        columns_dsl="Name, Status")
+        )
+        assert "@cols " in result
+        # @cols should only have Name and Status
+        cols_line = [l for l in result.split("\n") if l.startswith("@cols ")][0]
+        assert "Name" in cols_line
+        assert "Status" in cols_line
+        assert "Priority" not in cols_line
+        assert "Due" not in cols_line
+
+    def test_filter_and_sort_combined(self, test_db, event_loop):
+        """Filter + sort together."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Done = 0", sort_dsl="Priority desc")
+        )
+        assert "@rows 3" in result
+        lines = result.strip().split("\n")
+        data_start = None
+        for i, line in enumerate(lines):
+            if line == "" and i > 0:
+                data_start = i + 1
+        data_lines = [l for l in lines[data_start:] if l.strip()]
+        # First should be "Deploy v2" (priority 4, not done)
+        assert "Deploy v2" in data_lines[0]
+
+    def test_filter_is_empty(self, test_db, event_loop):
+        """Filter by is_empty on Notes."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Notes ?")
+        )
+        # "Write docs" and "Deploy v2" have no notes
+        assert "Write docs" in result
+        assert "Deploy v2" in result
+
+    def test_filter_error_unknown_property(self, test_db, event_loop):
+        """Unknown property returns error."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Nonexistent = foo")
+        )
+        assert "error: FILTER_ERROR" in result
+        assert "Unknown property" in result
+
+    def test_filter_error_bad_operator(self, test_db, event_loop):
+        """Invalid operator for type returns error."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "edit", depth=10, limit=50,
+                        filter_dsl="Status ~ Done")
+        )
+        assert "error: FILTER_ERROR" in result
+        assert "not valid" in result
+
+    def test_view_mode(self, test_db, event_loop):
+        """View mode works with filters (no short IDs in output)."""
+        result = event_loop.run_until_complete(
+            _read_impl(test_db["id"], "view", depth=10, limit=50,
+                        filter_dsl="Status = Done")
+        )
+        assert "@rows 2" in result
+        # In view mode, rows don't start with 4-char IDs
+        lines = result.strip().split("\n")
+        data_start = None
+        for i, line in enumerate(lines):
+            if line == "" and i > 0:
+                data_start = i + 1
+        if data_start:
+            data_lines = [l for l in lines[data_start:] if l.strip()]
+            if data_lines:
+                # First cell is icon (may be empty), second is name
+                cells = data_lines[0].split(",")
+                assert cells[1].startswith("Fix")
+
+
+# =============================================================================
+# DNN Mention Rendering Tests
+# =============================================================================
+
+
+class TestNotionRichTextToDnn:
+    """Tests for notion_rich_text_to_dnn — especially new mention types."""
+
+    def test_user_mention(self):
+        rich_text = [{"type": "mention", "mention": {
+            "type": "user", "user": {"id": "abc-123"}
+        }, "annotations": {"color": "default"}, "plain_text": "John"}]
+        assert notion_rich_text_to_dnn(rich_text) == "@user:abc-123"
+
+    def test_date_mention(self):
+        rich_text = [{"type": "mention", "mention": {
+            "type": "date", "date": {"start": "2025-06-15"}
+        }, "annotations": {"color": "default"}, "plain_text": "2025-06-15"}]
+        assert notion_rich_text_to_dnn(rich_text) == "@date:2025-06-15"
+
+    def test_date_range_mention(self):
+        rich_text = [{"type": "mention", "mention": {
+            "type": "date", "date": {"start": "2025-01-01", "end": "2025-12-31"}
+        }, "annotations": {"color": "default"}, "plain_text": "Jan-Dec"}]
+        assert notion_rich_text_to_dnn(rich_text) == "@date:2025-01-01→2025-12-31"
+
+    def test_page_mention(self):
+        rich_text = [{"type": "mention", "mention": {
+            "type": "page", "page": {"id": "abc-def-123"}
+        }, "annotations": {"color": "default"}, "plain_text": "My Page"}]
+        assert notion_rich_text_to_dnn(rich_text) == "[My Page](p:abc-def-123)"
+
+    def test_database_mention(self):
+        """Database mentions render as page links (databases are pages)."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "database", "database": {"id": "db-uuid-456"}
+        }, "annotations": {"color": "default"}, "plain_text": "Task DB"}]
+        assert notion_rich_text_to_dnn(rich_text) == "[Task DB](p:db-uuid-456)"
+
+    def test_link_mention(self):
+        """link_mention renders as standard link (preview card lost)."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "link_mention",
+            "link_mention": {"href": "https://example.com/article"}
+        }, "annotations": {"color": "default"},
+            "plain_text": "Example Article"}]
+        result = notion_rich_text_to_dnn(rich_text)
+        assert result == "[Example Article](https://example.com/article)"
+
+    def test_link_preview_mention(self):
+        """link_preview renders as standard link."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "link_preview",
+            "link_preview": {"url": "https://github.com/org/repo/pull/1"}
+        }, "annotations": {"color": "default"},
+            "plain_text": "PR #1"}]
+        result = notion_rich_text_to_dnn(rich_text)
+        assert result == "[PR #1](https://github.com/org/repo/pull/1)"
+
+    def test_template_mention(self):
+        """template_mention renders as plain text."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "template_mention",
+            "template_mention": {"type": "template_mention_date",
+                                 "template_mention_date": "today"}
+        }, "annotations": {"color": "default"}, "plain_text": "today"}]
+        assert notion_rich_text_to_dnn(rich_text) == "today"
+
+    def test_unknown_mention_type(self):
+        """Unknown mention types fall back to plain_text."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "future_type", "future_type": {"data": "something"}
+        }, "annotations": {"color": "default"}, "plain_text": "some text"}]
+        assert notion_rich_text_to_dnn(rich_text) == "some text"
+
+    def test_mention_with_bold_annotation(self):
+        """Annotations on mentions are preserved."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "page", "page": {"id": "abc-123"}
+        }, "annotations": {"bold": True, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "My Page"}]
+        assert notion_rich_text_to_dnn(rich_text) == "**[My Page](p:abc-123)**"
+
+    def test_mention_with_color_annotation(self):
+        """Color annotations on mentions are preserved."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "user", "user": {"id": "abc-123"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "red"},
+            "plain_text": "John"}]
+        assert notion_rich_text_to_dnn(rich_text) == ":red[@user:abc-123]"
+
+    def test_mention_with_code_annotation(self):
+        """Code annotation on mentions wraps in backticks."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "date", "date": {"start": "2025-01-01"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": True, "color": "default"},
+            "plain_text": "2025-01-01"}]
+        assert notion_rich_text_to_dnn(rich_text) == "`@date:2025-01-01`"
+
+    def test_mention_with_background_color(self):
+        """Background color annotation uses dash format."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "page", "page": {"id": "abc-123"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "blue_background"},
+            "plain_text": "My Page"}]
+        result = notion_rich_text_to_dnn(rich_text)
+        assert result == ":blue-background[[My Page](p:abc-123)]"
+
+    def test_mention_with_multiple_annotations(self):
+        """Multiple annotations stack correctly on mentions."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "user", "user": {"id": "abc-123"}
+        }, "annotations": {"bold": True, "italic": True,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "red"},
+            "plain_text": "John"}]
+        result = notion_rich_text_to_dnn(rich_text)
+        assert result == ":red[***@user:abc-123***]"
+
+    def test_equation(self):
+        rich_text = [{"type": "equation", "equation": {
+            "expression": "E = mc^2"
+        }}]
+        assert notion_rich_text_to_dnn(rich_text) == "$E = mc^2$"
+
+    def test_empty_rich_text(self):
+        assert notion_rich_text_to_dnn([]) == ""
+
+
+# =============================================================================
+# MOVE_MISSING_PARENT Error Detection Tests
+# =============================================================================
+
+
+class TestMoveMissingParentError:
+    """Tests for MOVE_MISSING_PARENT error detection."""
+
+    def test_move_missing_parent_detected(self):
+        """m X -> after=Y (no parent=) produces MOVE_MISSING_PARENT error."""
+        script = "m SRC1 -> after=AFT1"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "MOVE_MISSING_PARENT"
+        assert "parent=" in result.errors[0].message
+        assert "reposition" in result.errors[0].message
+        assert result.errors[0].line == 0
+        assert len(result.errors[0].suggestions) == 1
+        assert "parent=???" in result.errors[0].suggestions[0]
+
+    def test_valid_move_not_caught(self):
+        """Valid move command with parent= is not caught by this check."""
+        script = "m SRC1 -> parent=DST1 after=AFT1"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+        assert result.operations[0].command == ApplyCommand.MOVE
+
+    def test_move_without_after_not_caught(self):
+        """Move command without after= is not caught by missing-parent check."""
+        script = "m SRC1 -> parent=DST1"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+
+
+# =============================================================================
+# Movability Pre-Check Tests
+# =============================================================================
+
+
+class TestCheckMovability:
+    """Tests for _check_movability function."""
+
+    def test_paragraph_is_movable(self):
+        """Paragraph blocks move faithfully — no warnings, no errors."""
+        block = {"type": "paragraph", "paragraph": {
+            "rich_text": [{"type": "text", "text": {"content": "hello"}}]
+        }}
+        warnings, error = _check_movability(block)
+        assert error is None
+        assert warnings == []
+
+    def test_synced_block_is_unmovable(self):
+        """synced_block is refused with clear error."""
+        block = {"type": "synced_block", "synced_block": {}}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "sync relationship" in error
+
+    def test_link_preview_block_is_unmovable(self):
+        """link_preview block is refused."""
+        block = {"type": "link_preview", "link_preview": {
+            "url": "https://example.com"
+        }}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "integration-specific" in error
+
+    def test_table_is_unmovable(self):
+        """table block is refused."""
+        block = {"type": "table", "table": {}}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "table structure" in error
+
+    def test_table_of_contents_is_unmovable(self):
+        block = {"type": "table_of_contents", "table_of_contents": {}}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "positional" in error
+
+    def test_breadcrumb_is_unmovable(self):
+        block = {"type": "breadcrumb", "breadcrumb": {}}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "positional" in error
+
+    def test_unsupported_is_unmovable(self):
+        block = {"type": "unsupported", "unsupported": {}}
+        warnings, error = _check_movability(block)
+        assert error is not None
+        assert "unsupported" in error
+
+    def test_image_with_hosted_file_warns(self):
+        """Image block with Notion-hosted file gets info warning."""
+        block = {"type": "image", "image": {
+            "type": "file",
+            "file": {"url": "https://s3.aws.example.com/img.png"}
+        }}
+        warnings, error = _check_movability(block)
+        assert error is None
+        assert len(warnings) == 1
+        assert "re-uploaded" in warnings[0]
+
+    def test_image_with_external_url_no_warning(self):
+        """Image block with external URL — no warning needed."""
+        block = {"type": "image", "image": {
+            "type": "external",
+            "external": {"url": "https://example.com/img.png"}
+        }}
+        warnings, error = _check_movability(block)
+        assert error is None
+        assert warnings == []
+
+    def test_block_with_link_mention_warns(self):
+        """Block containing link_mention in rich_text gets warning."""
+        block = {"type": "paragraph", "paragraph": {
+            "rich_text": [
+                {"type": "text", "text": {"content": "See "}},
+                {"type": "mention", "mention": {
+                    "type": "link_mention",
+                    "link_mention": {"href": "https://example.com"}
+                }, "plain_text": "Example"}
+            ]
+        }}
+        warnings, error = _check_movability(block)
+        assert error is None
+        assert len(warnings) == 1
+        assert "rich URL embeds" in warnings[0]
+
+    def test_all_unmovable_types_covered(self):
+        """All UNMOVABLE_BLOCK_TYPES return errors."""
+        for block_type in UNMOVABLE_BLOCK_TYPES:
+            block = {"type": block_type, block_type: {}}
+            _, error = _check_movability(block)
+            assert error is not None, f"{block_type} should be unmovable"
+
+    def test_all_file_bearing_types_exist(self):
+        """Verify FILE_BEARING_BLOCK_TYPES covers expected types."""
+        assert FILE_BEARING_BLOCK_TYPES == {"image", "file", "video", "pdf"}
+
+
+# =============================================================================
+# File Re-upload Tests
+# =============================================================================
+
+
+class TestReuploadNotionFile:
+    """Tests for _reupload_notion_file with mocked API."""
+
+    def test_external_file_returned_as_is(self):
+        """External files don't need re-upload."""
+        file_obj = {"type": "external", "external": {
+            "url": "https://example.com/img.png"
+        }}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert warning is None
+
+    def test_file_upload_returned_as_is(self):
+        """Already-uploaded files don't need re-upload."""
+        file_obj = {"type": "file_upload", "file_upload": {"id": "existing-id"}}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert warning is None
+
+    def test_unknown_type_returned_as_is(self):
+        """Unknown file types are returned as-is."""
+        file_obj = {"type": "something_new", "something_new": {}}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert warning is None
+
+    def test_file_without_url_returns_warning(self):
+        """File with no URL returns a warning."""
+        file_obj = {"type": "file", "file": {}}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert "no URL" in warning
+
+    def test_successful_reupload(self, monkeypatch):
+        """Successful re-upload returns file_upload reference."""
+        import notion_mcp
+
+        poll_count = 0
+
+        async def mock_request(method, endpoint, json_body=None):
+            nonlocal poll_count
+            if method == "POST" and endpoint == "/file_uploads":
+                return {
+                    "id": "new-upload-id",
+                    "upload_url": "https://api.notion.com/v1/file_uploads/new-upload-id/send",
+                    "status": "pending",
+                }
+            if method == "GET" and "/file_uploads/" in endpoint:
+                poll_count += 1
+                if poll_count >= 2:
+                    return {"id": "new-upload-id", "status": "uploaded"}
+                return {"id": "new-upload-id", "status": "pending"}
+            return {}
+
+        # Mock the download (httpx client.get) and upload (client.post)
+        class MockResponse:
+            status_code = 200
+            content = b"fake-image-bytes"
+            def raise_for_status(self):
+                pass
+
+        class MockClient:
+            async def get(self, url, **kwargs):
+                return MockResponse()
+            async def post(self, url, **kwargs):
+                return MockResponse()
+
+        monkeypatch.setattr(notion_mcp, "_notion_request_async", mock_request)
+        async def mock_get_client():
+            return MockClient()
+        monkeypatch.setattr(notion_mcp, "_get_async_client", mock_get_client)
+        monkeypatch.setattr(notion_mcp, "_get_token", lambda: "fake-token")
+
+        file_obj = {"type": "file", "file": {
+            "url": "https://s3.amazonaws.com/some/image.png?sig=abc",
+            "expiry_time": "2025-01-01T00:00:00.000Z"
+        }}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result["type"] == "file_upload"
+        assert result["file_upload"]["id"] == "new-upload-id"
+        assert warning is None
+
+    def test_failed_reupload_falls_back(self, monkeypatch):
+        """Failed re-upload falls back to original with warning."""
+        import notion_mcp
+
+        async def mock_request(method, endpoint, json_body=None):
+            if method == "POST" and endpoint == "/file_uploads":
+                return {
+                    "id": "upload-id",
+                    "upload_url": "https://api.notion.com/v1/file_uploads/upload-id/send",
+                    "status": "pending",
+                }
+            if method == "GET" and "/file_uploads/" in endpoint:
+                return {"id": "upload-id", "status": "failed"}
+            return {}
+
+        class MockResponse:
+            status_code = 200
+            content = b"fake-image-bytes"
+            def raise_for_status(self):
+                pass
+
+        class MockClient:
+            async def get(self, url, **kwargs):
+                return MockResponse()
+            async def post(self, url, **kwargs):
+                return MockResponse()
+
+        monkeypatch.setattr(notion_mcp, "_notion_request_async", mock_request)
+        async def mock_get_client():
+            return MockClient()
+        monkeypatch.setattr(notion_mcp, "_get_async_client", mock_get_client)
+        monkeypatch.setattr(notion_mcp, "_get_token", lambda: "fake-token")
+
+        file_obj = {"type": "file", "file": {
+            "url": "https://s3.amazonaws.com/some/image.png",
+            "expiry_time": "2025-01-01T00:00:00.000Z"
+        }}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert "failed" in warning
+
+    def test_api_error_falls_back(self, monkeypatch):
+        """API exception on download falls back to original with warning."""
+        import notion_mcp
+
+        class MockClient:
+            async def get(self, url, **kwargs):
+                raise RuntimeError("Download failed")
+
+        async def mock_get_client():
+            return MockClient()
+        monkeypatch.setattr(notion_mcp, "_get_async_client", mock_get_client)
+
+        file_obj = {"type": "file", "file": {
+            "url": "https://s3.amazonaws.com/some/image.png",
+            "expiry_time": "2025-01-01T00:00:00.000Z"
+        }}
+        result, warning = asyncio.run(
+            _reupload_notion_file(file_obj)
+        )
+        assert result == file_obj
+        assert "failed" in warning
+
+
+# =============================================================================
+# DNN Round-Trip Tests (Mention Types)
+# =============================================================================
+
+
+class TestDnnMentionRoundTrip:
+    """Test that DNN render → parse → build preserves mention types."""
+
+    def test_user_mention_round_trip(self):
+        """User mention survives DNN round-trip."""
+        user_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        rich_text = [{"type": "mention", "mention": {
+            "type": "user", "user": {"id": user_uuid}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "John"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert f"@user:{user_uuid}" in dnn
+
+        # Parse back
+        spans = parse_inline_formatting(dnn)
+        assert any(s.span_type == "mention_user" and s.user_id == user_uuid
+                    for s in spans)
+
+    def test_date_mention_round_trip(self):
+        """Date mention survives DNN round-trip."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "date", "date": {"start": "2025-06-15"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "June 15"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert "@date:2025-06-15" in dnn
+
+        spans = parse_inline_formatting(dnn)
+        assert any(s.span_type == "mention_date" and s.date == "2025-06-15"
+                    for s in spans)
+
+    def test_date_range_mention_round_trip(self):
+        """Date range mention survives DNN round-trip."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "date", "date": {"start": "2025-01-01", "end": "2025-12-31"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "2025"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert "@date:2025-01-01→2025-12-31" in dnn
+
+        spans = parse_inline_formatting(dnn)
+        assert any(s.span_type == "mention_date" and s.date == "2025-01-01"
+                    and s.end_date == "2025-12-31" for s in spans)
+
+    def test_page_mention_round_trip(self):
+        """Page mention survives DNN round-trip as page link."""
+        page_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        rich_text = [{"type": "mention", "mention": {
+            "type": "page", "page": {"id": page_uuid}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "My Page"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert f"[My Page](p:{page_uuid})" in dnn
+
+        # Parse back — should create a link span with p: prefix
+        spans = parse_inline_formatting(dnn)
+        assert any(s.link and s.link.startswith("p:") for s in spans)
+
+    def test_database_mention_round_trip(self):
+        """Database mention renders as page link, survives round-trip."""
+        db_uuid = "db123456-e5f6-7890-abcd-ef1234567890"
+        rich_text = [{"type": "mention", "mention": {
+            "type": "database", "database": {"id": db_uuid}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "Task DB"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert f"[Task DB](p:{db_uuid})" in dnn
+
+    def test_link_mention_round_trip(self):
+        """link_mention renders as standard link, parseable on round-trip."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "link_mention",
+            "link_mention": {"href": "https://example.com/article"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "Example Article"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert "[Example Article](https://example.com/article)" in dnn
+
+        # Parse back — should create a link span
+        spans = parse_inline_formatting(dnn)
+        assert any(s.link == "https://example.com/article" for s in spans)
+
+    def test_template_mention_round_trip(self):
+        """template_mention renders as plain text."""
+        rich_text = [{"type": "mention", "mention": {
+            "type": "template_mention",
+            "template_mention": {"type": "template_mention_date",
+                                 "template_mention_date": "today"}
+        }, "annotations": {"bold": False, "italic": False,
+                           "strikethrough": False, "underline": False,
+                           "code": False, "color": "default"},
+            "plain_text": "today"}]
+
+        dnn = notion_rich_text_to_dnn(rich_text)
+        assert dnn == "today"
+
+
+class TestIdentifyMoveChains:
+    """Tests for _identify_move_chains — detecting consecutive same-parent moves."""
+
+    def _move_op(self, source, dest_parent, dest_after=None, line_num=0):
+        return ApplyOp(
+            command=ApplyCommand.MOVE,
+            line_num=line_num,
+            source=source,
+            dest_parent=dest_parent,
+            dest_after=dest_after,
+        )
+
+    def _add_op(self, parent, line_num=0):
+        return ApplyOp(
+            command=ApplyCommand.ADD,
+            line_num=line_num,
+            parent=parent,
+        )
+
+    def test_empty(self):
+        assert _identify_move_chains([]) == []
+
+    def test_single_move(self):
+        """A single move is not a chain."""
+        ops = [self._move_op("A", "X")]
+        assert _identify_move_chains(ops) == []
+
+    def test_two_moves_same_parent(self):
+        """Two consecutive moves to the same parent form a chain."""
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "X"),
+        ]
+        assert _identify_move_chains(ops) == [[0, 1]]
+
+    def test_three_moves_same_parent(self):
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "X"),
+            self._move_op("C", "X"),
+        ]
+        assert _identify_move_chains(ops) == [[0, 1, 2]]
+
+    def test_two_moves_different_parents(self):
+        """Moves to different parents don't chain."""
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "Y"),
+        ]
+        assert _identify_move_chains(ops) == []
+
+    def test_explicit_after_breaks_chain(self):
+        """A move with explicit after= is not chainable."""
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "X", dest_after="Z"),
+            self._move_op("C", "X"),
+        ]
+        # A is alone (chain of 1), B has explicit after (standalone),
+        # C is alone (chain of 1). No chains of length >= 2.
+        assert _identify_move_chains(ops) == []
+
+    def test_non_move_breaks_chain(self):
+        """A non-move op between moves breaks the chain."""
+        ops = [
+            self._move_op("A", "X"),
+            self._add_op("Y"),
+            self._move_op("B", "X"),
+        ]
+        assert _identify_move_chains(ops) == []
+
+    def test_two_separate_chains(self):
+        """Different parent groups form separate chains."""
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "X"),
+            self._move_op("C", "Y"),
+            self._move_op("D", "Y"),
+        ]
+        assert _identify_move_chains(ops) == [[0, 1], [2, 3]]
+
+    def test_chain_then_single(self):
+        """Chain followed by a lone move to a different parent."""
+        ops = [
+            self._move_op("A", "X"),
+            self._move_op("B", "X"),
+            self._move_op("C", "Y"),
+        ]
+        assert _identify_move_chains(ops) == [[0, 1]]
+
+    def test_mixed_ops_with_chain(self):
+        """Chain surrounded by non-move ops."""
+        ops = [
+            self._add_op("Z"),
+            self._move_op("A", "X"),
+            self._move_op("B", "X"),
+            self._move_op("C", "X"),
+            self._add_op("Z"),
+        ]
+        assert _identify_move_chains(ops) == [[1, 2, 3]]
