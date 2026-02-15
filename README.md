@@ -27,7 +27,7 @@ eP5m   - *Does this sound too much like a cat?*
 gI7N   - See @p:R4kQ
 ```
 
-There are many small differences from markdown — `>` is a toggle (foldable section), `:red[...]` is colored text ([following Streamlit](https://docs.streamlit.io/develop/api-reference/text/st.markdown)), `@p:R4kQ` is a page mention — but the format is designed to be immediately readable without learning anything new. For the full specification covering all block types, inline formatting, mutation commands, and error codes, see [docs/dnn-spec.md](docs/dnn-spec.md).
+There are many small differences from markdown — `>` is a toggle (foldable section), `@p:R4kQ` is a page mention, and [following Streamlit](https://docs.streamlit.io/develop/api-reference/text/st.markdown), `:red[...]` is colored text — but the format is designed to be immediately readable without learning anything new. For the full specification covering all block types, inline formatting, mutation commands, and error codes, see [docs/dnn-spec.md](docs/dnn-spec.md).
 
 One big departure from markdown is those four-character codes on the left (`R4kQ`, `t9Xm`, ...). Each one is a token-efficient reference to a Notion block. The MCP server manages these IDs across reads and writes so that edits target the correct blocks.
 

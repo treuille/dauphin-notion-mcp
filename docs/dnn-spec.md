@@ -16,7 +16,7 @@ A simple paragraph "Hello World" returns ~400 chars of JSON.
 1. **Markdown-inspired** - familiar syntax for headings, lists, etc.
 2. **Indentation for nesting** - 2 spaces = 1 level
 3. **Fixed 4-char IDs** - left-justified, session-scoped mapping
-4. **Per-span colors** - `:red[text]` Streamlit-style inline
+4. **Per-span colors** - `:red[text]` [Streamlit-style](https://docs.streamlit.io/develop/api-reference/text/st.markdown) inline
 5. **Read-only mode** - omit IDs entirely for max compression
 6. **Opaque blocks** - unsupported types shown as `!type` placeholders
 
