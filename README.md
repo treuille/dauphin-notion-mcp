@@ -98,6 +98,7 @@ Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply
 - **Page positioning** — `+page` now accepts `after=<block_id>` and `pos=start` to control where new pages appear within their parent.
 - **Variable-length code fences** — code blocks now support 3+ backticks, with the closing fence required to match the opening length.
 - **Improved `!`-prefix disambiguation** — callout, opaque, and structural blocks all start with `!` and are now disambiguated in a clear priority order: colored callouts → opaque (`!type~`) → structural (`!type N`) → default callout.
+- **Better tool docstrings** — the `notion.apply` tool description now includes full syntax reference for database schema commands (`+db`, `+prop`, `xprop`, `uprop`) and page positioning (`after=`, `pos=start`).
 
 ### 2026-02-14
 

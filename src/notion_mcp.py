@@ -7055,10 +7055,35 @@ async def notion_apply(
     Page Commands:
         +page parent=ID title="Title" [icon=📝] [cover=URL]
           Content blocks...
+        +page parent=ID after=BLOCK title="Title"   (after specific block)
+        +page parent=ID pos=start title="Title"      (at top of parent)
         mpage ID -> parent=ID
         xpage ID
         upage ID [= "New Title"] [icon=📝] [cover=URL]
         cpage ID -> parent=ID [title="Copy Title"]
+
+    Database Schema Commands:
+        +db parent=ID title="DB Name" [icon=📊]
+          Name(title)
+          Status(select: Todo, Doing, Done)
+          Due(date)
+          Done(checkbox)
+          Priority(number: dollar)
+          Tags(multi_select: Bug, Feature)
+          TaskID(id: TASK)
+          Projects(relation: DbId)
+          Tasks(relation: DbId, dual: "Back Ref Name")
+
+        +prop db=ID PropName(type)
+        +prop db=ID PropName(type: config)
+        xprop db=ID PropName
+        xprop db=ID "Prop Name With Spaces"
+        uprop db=ID OldName -> "New Name"
+
+    Property Types:
+        title, text, number, select, multi_select, date,
+        checkbox, url, email, phone, id, relation,
+        created, created_by, edited, edited_by
 
     Database Row Commands:
         +row db=ID
