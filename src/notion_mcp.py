@@ -412,6 +412,8 @@ class DnnBlock:
     heading_level: Optional[int] = None  # For headings (1, 2, or 3)
     is_toggle: bool = False  # For toggle blocks/headings
     color: Optional[str] = None  # For callout blocks (e.g., "gray_background")
+    opaque: bool = False  # For opaque blocks (!type~)
+    structural: bool = False  # For structural blocks (!type N)
     warnings: list[str] = field(default_factory=list)  # Parser warnings
 
 
@@ -436,19 +438,22 @@ BLOCK_MARKERS = [
     (re.compile(r'^- (.*)$'), 'bulleted_list_item', {}),
     # Toggle (single >)
     (re.compile(r'^> (.*)$'), 'toggle', {}),
-    # Quote (pipe)
+    # Table row (pipe-delimited with trailing pipe): | cell | cell |
+    # Must come before quote — trailing | distinguishes table from quote
+    (re.compile(r'^(\|.*\|)\s*$'), 'table_row', {}),
+    # Quote (pipe, no trailing pipe): | text
     (re.compile(r'^\| (.*)$'), 'quote', {}),
-    # Callout with optional color: !gray text, !blue text, or just ! text
-    (re.compile(r'^!(gray|brown|orange|yellow|green|blue|purple|pink|red) (.*)$'), 'callout', {}),
-    (re.compile(r'^! (.*)$'), 'callout', {'color': 'default'}),
+    # Callout / opaque / structural: all !-prefixed blocks handled
+    # in parse_block_type() before BLOCK_MARKERS loop. See there for
+    # disambiguation order: colors → opaque (~) → structural (N) → default.
     # Child page
     (re.compile(r'^§ (.*)$'), 'child_page', {}),
     # Child database
     (re.compile(r'^⊞ (.*)$'), 'child_database', {}),
     # Link to page
     (re.compile(r'^→ (.*)$'), 'link_to_page', {}),
-    # Code block start
-    (re.compile(r'^```(\w*)$'), 'code', {}),
+    # Code block start (3+ backticks, optional language)
+    (re.compile(r'^`{3,}(\w*)$'), 'code', {}),
 ]
 
 
@@ -478,19 +483,71 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
         )
         return 'paragraph', content, {}, warnings
 
+    # Handle all !-prefixed blocks: callout, opaque, structural
+    # Disambiguation order: colors → opaque (~) → structural (N) → default callout
+    if content.startswith('!'):
+        # 1. Colored callout: !color text
+        callout_match = re.match(
+            r'^!(gray|brown|orange|yellow|green|blue|purple|pink|red) (.*)$', content
+        )
+        if callout_match:
+            matched_text = callout_match.group(2)
+            # Double-delimiter warning
+            if matched_text:
+                double_marker = re.match(r'^(#{1,3}|[-*]|\d+\.|>\s*#{1,3}|>|!\w*|\||\[[ x]\])\s', matched_text)
+                if double_marker:
+                    warnings.append(
+                        f"Content starts with '{double_marker.group(1)}' - "
+                        f"looks like nested delimiters. Did you mean to change block type?"
+                    )
+            return 'callout', matched_text, {'color': callout_match.group(1) + '_background'}, warnings
+
+        # 2. Opaque block: !type~ or !type~ (caption)
+        opaque_match = re.match(r'^!(\w+)~(.*)$', content)
+        if opaque_match and opaque_match.group(1) in OPAQUE_BLOCK_TYPES:
+            opaque_type = opaque_match.group(1)
+            caption = opaque_match.group(2).strip()
+            if caption.startswith('(') and caption.endswith(')'):
+                caption = caption[1:-1]
+            return opaque_type, caption, {'opaque': True}, warnings
+
+        # 3. Structural block: !type N
+        struct_match = re.match(r'^!(\w+) (\d+)$', content)
+        if struct_match and struct_match.group(1) in STRUCTURAL_BLOCK_TYPES:
+            real_type = STRUCTURAL_BLOCK_TYPES[struct_match.group(1)]
+            return real_type, struct_match.group(2), {'structural': True}, warnings
+
+        # 4. Default callout: ! text (fallback)
+        default_match = re.match(r'^! (.*)$', content)
+        if default_match:
+            matched_text = default_match.group(1)
+            # Double-delimiter warning
+            if matched_text:
+                double_marker = re.match(r'^(#{1,3}|[-*]|\d+\.|>\s*#{1,3}|>|!\w*|\||\[[ x]\])\s', matched_text)
+                if double_marker:
+                    warnings.append(
+                        f"Content starts with '{double_marker.group(1)}' - "
+                        f"looks like nested delimiters. Did you mean to change block type?"
+                    )
+            return 'callout', matched_text, {'color': 'default'}, warnings
+
     # Try each marker in precedence order
     for pattern, block_type, attrs in BLOCK_MARKERS:
         match = pattern.match(content)
         if match:
-            if block_type == 'numbered_list_item':
+            if block_type == 'table_row':
+                raw_row = match.group(1)
+                # Check for Markdown separator row (|---|---|) — skip silently
+                if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)*\|$', raw_row):
+                    return 'table_separator', '', {}, warnings
+                # Parse cells: split on unescaped pipes, strip outer pipes
+                return block_type, raw_row, {}, warnings
+            elif block_type == 'numbered_list_item':
                 matched_text = match.group(2)
             elif block_type == 'code':
                 return block_type, '', {'language': match.group(1) or None}, warnings
             elif block_type == 'divider':
                 return block_type, '', attrs.copy(), warnings
-            elif block_type == 'callout' and match.lastindex == 2:
-                matched_text = match.group(2)
-                attrs = {'color': match.group(1) + '_background'}
             else:
                 matched_text = match.group(1)
 
@@ -560,6 +617,39 @@ def strip_marker_for_block(text: str, target_type: str) -> tuple[str, dict, list
         f"To change block type, delete and recreate."
     )
     return clean_text, attrs, warnings
+
+
+def parse_table_row_cells(raw_row: str) -> list[str]:
+    """Parse pipe-delimited table row into cell strings.
+
+    Input: "| Name | Age | City |"
+    Output: ["Name", "Age", "City"]
+
+    Handles escaped pipes (\\|) within cell content.
+    """
+    # Strip outer pipes and split on unescaped pipes
+    inner = raw_row.strip()
+    if inner.startswith('|'):
+        inner = inner[1:]
+    if inner.endswith('|'):
+        inner = inner[:-1]
+
+    # Split on unescaped pipes (not preceded by backslash)
+    cells = re.split(r'(?<!\\)\|', inner)
+    # Unescape pipes and strip whitespace
+    return [cell.strip().replace('\\|', '|') for cell in cells]
+
+
+def cells_to_pipe_row(cells: list[str]) -> str:
+    """Convert cell strings to pipe-delimited row.
+
+    Input: ["Name", "Age", "City"]
+    Output: "| Name | Age | City |"
+
+    Escapes pipe characters in cell content.
+    """
+    escaped = [cell.replace('|', '\\|') for cell in cells]
+    return "| " + " | ".join(escaped) + " |"
 
 
 def calculate_indent_level(line_after_id: str) -> tuple[int, str]:
@@ -1202,6 +1292,7 @@ def parse_dnn(dnn_text: str) -> DnnParseResult:
     state = ParseState.HEADER
     current_code_block: Optional[DnnBlock] = None
     code_block_indent: int = 0
+    code_block_backtick_count: int = 3
 
     for line_num, line in enumerate(lines, start=1):
         # Skip empty lines in header
@@ -1270,12 +1361,13 @@ def parse_dnn(dnn_text: str) -> DnnParseResult:
                         header.columns = cols
                 continue
 
-        # CODE state: collect raw lines until closing ```
+        # CODE state: collect raw lines until closing backticks
         if state == ParseState.CODE:
-            # Check for closing ```
+            # Check for closing delimiter (must match backtick count and indent)
             stripped = line.lstrip(' ')
             indent = len(line) - len(stripped)
-            if stripped == '```' and indent == code_block_indent:
+            expected_close = '`' * code_block_backtick_count
+            if stripped == expected_close and indent == code_block_indent:
                 # End of code block
                 if current_code_block:
                     blocks.append(current_code_block)
@@ -1377,21 +1469,24 @@ def parse_dnn(dnn_text: str) -> DnnParseResult:
                 state = ParseState.CODE
                 current_code_block = block
                 code_block_indent = spaces
+                # Count backticks in opening delimiter for matching close
+                code_block_backtick_count = len(content) - len(content.lstrip('`'))
                 continue
 
             blocks.append(block)
 
     # Check for unterminated code block
     if state == ParseState.CODE and current_code_block:
+        closing_fence = '`' * code_block_backtick_count
         errors.append(DnnParseError(
             code="CODE_BLOCK_UNTERMINATED",
             message="Code block not closed",
             line=len(lines),
             excerpt=f"EOF",
-            suggestions=["Add closing ``` at same indent level"],
+            suggestions=[f"Add closing {closing_fence} at same indent level"],
             autofix={
                 "safe": True,
-                "patched": f"{' ' * code_block_indent}```"
+                "patched": f"{' ' * code_block_indent}{closing_fence}"
             }
         ))
         # Still add the incomplete code block
@@ -1505,14 +1600,28 @@ async def _notion_request_async(
 # Block Fetching
 # =============================================================================
 
-# Block types that are "opaque" (rendered as placeholders)
+# Block types that are "opaque" (rendered as !type~ placeholders)
 OPAQUE_BLOCK_TYPES = {
     'image', 'video', 'file', 'pdf', 'bookmark', 'embed',
     'link_preview', 'synced_block',
-    'table', 'table_row', 'table_of_contents', 'breadcrumb',
+    'table_of_contents', 'breadcrumb',
     'equation', 'template', 'link_to_page', 'unsupported'
 }
-# Note: column_list and column are handled specially, not as opaque
+# Note: table and table_row are now rendered with full read/write support
+
+# Structural block types: DNN name → Notion block type
+# Rendered as !name N (editable containers with children)
+STRUCTURAL_BLOCK_TYPES = {
+    'cols': 'column_list',
+    'col': 'column',
+    'table': 'table',
+}
+
+# Callout color names (used in ! prefix disambiguation)
+CALLOUT_COLORS = {
+    'gray', 'brown', 'orange', 'yellow', 'green',
+    'blue', 'purple', 'pink', 'red'
+}
 
 # Block types that can have children
 PARENT_BLOCK_TYPES = {
@@ -1809,6 +1918,287 @@ PROPERTY_TYPE_MAP = {
     "last_edited_by": "edited_by",
     "unique_id": "id",
 }
+
+# Reverse mapping: DNN short name → Notion API type
+# Used by +db and +prop to convert property definitions to API format
+DNN_TO_API_TYPE = {v: k for k, v in PROPERTY_TYPE_MAP.items()}
+
+# Property types supported by +db and +prop
+CREATABLE_PROPERTY_TYPES = {
+    "title", "text", "number", "select", "multi_select",
+    "date", "checkbox", "url", "email", "phone",
+    "relation", "created", "created_by", "edited", "edited_by", "id",
+}
+
+# Number format aliases
+NUMBER_FORMATS = {
+    "number", "number_with_commas", "percent",
+    "dollar", "euro", "pound", "yen",
+    "canadian_dollar", "australian_dollar", "swiss_franc",
+    "danish_krone", "norwegian_krone", "swedish_krona",
+    "singapore_dollar", "hong_kong_dollar", "new_zealand_dollar",
+    "mexican_peso", "south_african_rand", "brazilian_real",
+    "indian_rupee", "chinese_yuan", "japanese_yen",
+    "korean_won", "philippine_peso", "thai_baht",
+    "indonesian_rupiah", "turkish_lira", "russian_ruble",
+    "colombian_peso", "chilean_peso", "peruvian_sol",
+    "argentine_peso", "uruguayan_peso",
+    "emirati_dirham", "saudi_riyal", "qatari_riyal",
+    "omani_rial", "kuwaiti_dinar", "bahraini_dinar",
+    "egyptian_pound", "nigerian_naira", "kenyan_shilling",
+    "zloty", "czech_koruna", "forint", "hryvnia", "leu", "lev",
+    "shekel", "new_taiwan_dollar", "baht", "ringgit", "rupiah",
+}
+
+
+@dataclass
+class PropertyDef:
+    """Parsed property definition from Name(type: config) syntax."""
+    name: str
+    dnn_type: str          # DNN short name (e.g., "select", "text")
+    api_type: str          # Notion API type (e.g., "select", "rich_text")
+    options: list[str]     # For select/multi_select option names
+    number_format: str     # For number type format
+    id_prefix: str         # For unique_id prefix
+    relation_db: str       # For relation: target database short ID
+    relation_dual: str     # For relation dual: back-reference name
+
+
+def parse_property_def(text: str) -> tuple[Optional[PropertyDef], Optional[str]]:
+    """Parse a property definition like Name(type) or Name(type: config).
+
+    Syntax:
+        Name(type)
+        Name(type: arg)
+        Name(type: a, b, c)
+        "Quoted Name"(type: arg)
+        Name(relation: DbId, dual: "Back Ref Name")
+
+    Args:
+        text: Property definition string (stripped).
+
+    Returns:
+        Tuple of (PropertyDef, None) on success, or (None, error_message) on failure.
+    """
+    text = text.strip()
+    if not text:
+        return None, "Empty property definition"
+
+    # Parse name — either quoted or unquoted
+    if text.startswith('"'):
+        # Quoted name: find closing quote before (
+        close_quote = text.find('"', 1)
+        if close_quote == -1:
+            return None, f"Unclosed quote in property name: {text}"
+        name = text[1:close_quote]
+        rest = text[close_quote + 1:]
+    else:
+        # Unquoted name: everything before (
+        paren_idx = text.find('(')
+        if paren_idx == -1:
+            return None, f"Missing type in property definition: {text} (expected Name(type))"
+        name = text[:paren_idx]
+        rest = text[paren_idx:]
+
+    if not name:
+        return None, f"Empty property name in: {text}"
+
+    # Parse (type: config)
+    if not rest.startswith('('):
+        return None, f"Expected '(' after property name in: {text}"
+    if not rest.endswith(')'):
+        return None, f"Expected ')' at end of property definition: {text}"
+
+    inner = rest[1:-1].strip()  # Contents between parens
+    if not inner:
+        return None, f"Empty type in property definition: {text}"
+
+    # Split type from config
+    # For relation with dual, we need careful parsing:
+    #   relation: DbId, dual: "Name"
+    # Simple split on first colon for type
+    colon_idx = inner.find(':')
+    if colon_idx == -1:
+        # No config, just type
+        dnn_type = inner.strip()
+        config_str = ""
+    else:
+        dnn_type = inner[:colon_idx].strip()
+        config_str = inner[colon_idx + 1:].strip()
+
+    # Validate DNN type
+    if dnn_type not in CREATABLE_PROPERTY_TYPES:
+        return None, (
+            f"Unsupported property type '{dnn_type}' in: {text}. "
+            f"Supported types: {', '.join(sorted(CREATABLE_PROPERTY_TYPES))}"
+        )
+
+    api_type = DNN_TO_API_TYPE[dnn_type]
+
+    # Build PropertyDef based on type
+    prop_def = PropertyDef(
+        name=name,
+        dnn_type=dnn_type,
+        api_type=api_type,
+        options=[],
+        number_format="",
+        id_prefix="",
+        relation_db="",
+        relation_dual="",
+    )
+
+    if not config_str:
+        # Relation requires a target database ID
+        if dnn_type == "relation":
+            return None, f"Relation property requires a target database ID: {text} (expected relation: DbId)"
+        return prop_def, None
+
+    # Parse config based on type
+    if dnn_type in ("select", "multi_select"):
+        # Config is comma-separated option names
+        prop_def.options = [o.strip() for o in config_str.split(",") if o.strip()]
+    elif dnn_type == "number":
+        fmt = config_str.strip()
+        if fmt not in NUMBER_FORMATS:
+            return None, (
+                f"Unknown number format '{fmt}' in: {text}. "
+                f"Common formats: number, number_with_commas, percent, dollar, euro, pound, yen"
+            )
+        prop_def.number_format = fmt
+    elif dnn_type == "id":
+        prop_def.id_prefix = config_str.strip()
+    elif dnn_type == "relation":
+        # Parse: DbId  or  DbId, dual: "Name"
+        parts = _split_relation_config(config_str)
+        if isinstance(parts, str):
+            return None, parts  # Error message
+        prop_def.relation_db, prop_def.relation_dual = parts
+    else:
+        return None, f"Type '{dnn_type}' does not accept config in: {text}"
+
+    return prop_def, None
+
+
+def _split_relation_config(config: str) -> tuple[str, str] | str:
+    """Parse relation config: 'DbId' or 'DbId, dual: "Name"'.
+
+    Returns:
+        (db_id, dual_name) tuple on success, or error string on failure.
+    """
+    config = config.strip()
+
+    # Check for dual: parameter
+    # Find 'dual:' that isn't inside quotes
+    dual_idx = -1
+    in_quotes = False
+    for i, ch in enumerate(config):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif not in_quotes and config[i:].startswith("dual:"):
+            # Check that it's preceded by a comma
+            dual_idx = i
+            break
+
+    if dual_idx == -1:
+        # No dual, just db_id
+        db_id = config.strip().rstrip(",").strip()
+        if not db_id:
+            return "Relation property requires a target database ID"
+        return (db_id, "")
+
+    # Split into db_id part and dual part
+    db_part = config[:dual_idx].strip().rstrip(",").strip()
+    dual_part = config[dual_idx + 5:].strip()  # Skip "dual:"
+
+    if not db_part:
+        return "Relation property requires a target database ID before 'dual:'"
+
+    # Parse dual name (may be quoted)
+    if dual_part.startswith('"'):
+        close = dual_part.find('"', 1)
+        if close == -1:
+            return f"Unclosed quote in dual property name: {dual_part}"
+        dual_name = dual_part[1:close]
+    else:
+        dual_name = dual_part.strip()
+
+    if not dual_name:
+        return "dual: requires a property name for the back-reference"
+
+    return (db_part, dual_name)
+
+
+def property_def_to_notion(prop_def: PropertyDef) -> dict:
+    """Convert a PropertyDef to a Notion API property schema object.
+
+    This builds the property configuration used in POST /databases
+    (initial_data_source.properties) or PATCH /data_sources.
+
+    Args:
+        prop_def: Parsed property definition.
+
+    Returns:
+        Notion API property schema dict (e.g., {"select": {"options": [...]}}).
+    """
+    api_type = prop_def.api_type
+
+    if api_type == "title":
+        return {"title": {}}
+    elif api_type == "rich_text":
+        return {"rich_text": {}}
+    elif api_type == "date":
+        return {"date": {}}
+    elif api_type == "checkbox":
+        return {"checkbox": {}}
+    elif api_type == "url":
+        return {"url": {}}
+    elif api_type == "email":
+        return {"email": {}}
+    elif api_type == "phone_number":
+        return {"phone_number": {}}
+    elif api_type == "created_time":
+        return {"created_time": {}}
+    elif api_type == "created_by":
+        return {"created_by": {}}
+    elif api_type == "last_edited_time":
+        return {"last_edited_time": {}}
+    elif api_type == "last_edited_by":
+        return {"last_edited_by": {}}
+    elif api_type == "select":
+        config: dict = {}
+        if prop_def.options:
+            config["options"] = [{"name": o} for o in prop_def.options]
+        return {"select": config}
+    elif api_type == "multi_select":
+        config = {}
+        if prop_def.options:
+            config["options"] = [{"name": o} for o in prop_def.options]
+        return {"multi_select": config}
+    elif api_type == "number":
+        config = {}
+        if prop_def.number_format:
+            config["format"] = prop_def.number_format
+        return {"number": config}
+    elif api_type == "unique_id":
+        config = {}
+        if prop_def.id_prefix:
+            config["prefix"] = prop_def.id_prefix
+        return {"unique_id": config}
+    elif api_type == "relation":
+        # Relation needs special handling — db_id is resolved at execution time
+        # Store the target DB short ID; execution will resolve to full UUID
+        # and look up the data source ID
+        config = {"database_id": prop_def.relation_db}
+        if prop_def.relation_dual:
+            config["type"] = "dual_property"
+            config["dual_property"] = {"synced_property_name": prop_def.relation_dual}
+        else:
+            config["type"] = "single_property"
+            config["single_property"] = {}
+        return {"relation": config}
+    else:
+        # Fallback: empty config
+        return {api_type: {}}
 
 
 # =============================================================================
@@ -2611,7 +3001,7 @@ def render_column_to_dnn(
     indent = "  " * level
 
     # Render column marker with number
-    _append_dnn_line(lines, mode, short_id, indent, f"║{column_number}")
+    _append_dnn_line(lines, mode, short_id, indent, f"!col {column_number}")
 
     # Render column's children
     children = block.get("_children", [])
@@ -2648,25 +3038,17 @@ def render_block_to_dnn(
     # Build indent
     indent = "  " * level
 
-    # Handle opaque blocks
+    # Handle opaque blocks — all get !type~ suffix
     if block_type in OPAQUE_BLOCK_TYPES:
-        # Render as placeholder
         type_data = block.get(block_type, {})
         caption = ""
         if "caption" in type_data:
             caption = notion_rich_text_to_dnn(type_data["caption"])
 
-        suffix = ""
-        if block.get("has_children"):
-            suffix = "*"  # Has hidden children
-        if block_type in ('image', 'file', 'video', 'pdf', 'bookmark'):
-            suffix = "~"  # Clone may be lossy
-
-        placeholder = f"!{block_type}{suffix}"
+        placeholder = f"!{block_type}~"
         if caption:
             placeholder += f" ({caption})"
 
-        # Use _append_dnn_line helper for mode-aware output
         _append_dnn_line(lines, mode, short_id, indent, placeholder)
         return lines
 
@@ -2679,11 +3061,11 @@ def render_block_to_dnn(
         return lines
 
     if block_type == "column_list":
-        # Render column_list with ⫼N marker (N = number of columns)
+        # Render column_list with !cols N marker
         children = block.get("_children", [])
         num_columns = len(children)
 
-        _append_dnn_line(lines, mode, short_id, indent, f"⫼{num_columns}")
+        _append_dnn_line(lines, mode, short_id, indent, f"!cols {num_columns}")
 
         # Render each column with its number
         for i, column in enumerate(children, 1):
@@ -2691,17 +3073,47 @@ def render_block_to_dnn(
 
         return lines
 
+    if block_type == "table":
+        # Render table with !table N marker (N = table_width)
+        table_width = type_data.get("table_width", 0)
+        _append_dnn_line(lines, mode, short_id, indent, f"!table {table_width}")
+
+        # Render table_row children
+        children = block.get("_children", [])
+        for child in children:
+            lines.extend(render_block_to_dnn(child, registry, level + 1, mode))
+
+        return lines
+
+    if block_type == "table_row":
+        # Render as | cell | cell | with pipe-delimited cells
+        cells = type_data.get("cells", [])
+        cell_texts = []
+        for cell in cells:
+            cell_dnn = notion_rich_text_to_dnn(cell)
+            # Escape literal pipes in cell content
+            cell_dnn = cell_dnn.replace('|', '\\|')
+            cell_texts.append(cell_dnn)
+        row_content = "| " + " | ".join(cell_texts) + " |"
+        _append_dnn_line(lines, mode, short_id, indent, row_content)
+        return lines
+
     if block_type == "code":
         language = type_data.get("language", "")
         rich_text = type_data.get("rich_text", [])
         code_content = "".join(t.get("plain_text", "") for t in rich_text)
 
-        _append_dnn_line(lines, mode, short_id, indent, f"```{language}")
+        # Count longest backtick run in content to avoid collision
+        backtick_runs = re.findall(r'`+', code_content)
+        longest = max((len(r) for r in backtick_runs), default=0)
+        fence = '`' * max(3, longest + 1)
+
+        _append_dnn_line(lines, mode, short_id, indent, f"{fence}{language}")
 
         for code_line in code_content.split("\n"):
             lines.append(code_line)
 
-        lines.append(f"{indent}```")
+        lines.append(f"{indent}{fence}")
         return lines
 
     if block_type == "to_do":
@@ -2976,6 +3388,10 @@ class ApplyCommand(Enum):
     ADD_ROW = "+row"    # Add database row
     UPDATE_ROW = "urow" # Update row properties
     DELETE_ROW = "xrow" # Delete row
+    ADD_DB = "+db"         # Create database
+    ADD_PROP = "+prop"     # Add property to database
+    DELETE_PROP = "xprop"  # Delete property from database
+    RENAME_PROP = "uprop"  # Rename property in database
 
 
 @dataclass
@@ -3006,6 +3422,15 @@ class ApplyOp:
     # For row commands
     database: Optional[str] = None
     row_values: dict[str, str] = field(default_factory=dict)
+    # For +db command
+    property_defs: list['PropertyDef'] = field(default_factory=list)
+    # For +prop command (single property def)
+    property_def: Optional['PropertyDef'] = None
+    # For uprop command (rename)
+    old_name: Optional[str] = None
+    new_name: Optional[str] = None
+    # For +page positional insertion
+    position: Optional[str] = None  # "start" for pos=start
 
 
 @dataclass
@@ -3064,8 +3489,12 @@ def _decode_escape_sequences(text: str) -> str:
     return ''.join(result)
 
 # Page command patterns
+# Groups: 1=parent, 2=after (optional), 3=pos (optional), 4=title, 5=icon, 6=cover
 ADD_PAGE_PATTERN = re.compile(
-    r'^\+page\s+parent=(\S+)\s+title="([^"]*)"'
+    r'^\+page\s+parent=(\S+)'
+    r'(?:\s+after=(\S+))?'
+    r'(?:\s+pos=(\S+))?'
+    r'\s+title="([^"]*)"'
     r'(?:\s+icon=(\S+))?(?:\s+cover=(\S+))?$'
 )
 MOVE_PAGE_PATTERN = re.compile(r'^mpage\s+(\S+)\s+->\s+parent=(\S+)$')
@@ -3082,6 +3511,17 @@ COPY_PAGE_PATTERN = re.compile(
 ADD_ROW_PATTERN = re.compile(r'^\+row\s+db=(\S+)(?:\s+icon=(\S+))?$')
 UPDATE_ROW_PATTERN = re.compile(r'^urow\s+(\S+)$')
 DELETE_ROW_PATTERN = re.compile(r'^xrow\s+(\S+)$')
+
+# Database command patterns
+ADD_DB_PATTERN = re.compile(
+    r'^\+db\s+parent=(\S+)\s+title="([^"]*)"'
+    r'(?:\s+icon=(\S+))?$'
+)
+ADD_PROP_PATTERN = re.compile(r'^\+prop\s+db=(\S+)\s+(.+)$')
+DELETE_PROP_PATTERN = re.compile(r'^xprop\s+db=(\S+)\s+(.+)$')
+RENAME_PROP_PATTERN = re.compile(
+    r'^uprop\s+db=(\S+)\s+(.+?)\s+->\s+(.+)$'
+)
 
 
 def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
@@ -3172,14 +3612,29 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                 parent=parent,
                 after=after
             )
-            # Collect indented content lines
+            # Collect indented content lines (code-block-aware)
             i += 1
             content_lines = []
+            in_code_block = False
+            code_fence_count = 0
             while i < len(lines):
                 content_line = lines[i]
-                # Content lines must be indented
-                if content_line and content_line[0] in ' \t':
+                if in_code_block:
+                    # Inside code block: collect all lines until closing fence
                     content_lines.append(content_line)
+                    stripped_cl = content_line.lstrip()
+                    expected_close = '`' * code_fence_count
+                    if stripped_cl == expected_close:
+                        in_code_block = False
+                    i += 1
+                elif content_line and content_line[0] in ' \t':
+                    content_lines.append(content_line)
+                    # Check if this line opens a code block
+                    stripped_cl = content_line.lstrip()
+                    fence_match = re.match(r'^(`{3,})\w*$', stripped_cl)
+                    if fence_match:
+                        in_code_block = True
+                        code_fence_count = len(fence_match.group(1))
                     i += 1
                 else:
                     break
@@ -3244,24 +3699,42 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # +page parent=X title="Y" [icon=Z] [cover=W]
+        # +page parent=X [after=Y] [pos=start] title="Z" [icon=W] [cover=V]
         match = ADD_PAGE_PATTERN.match(line)
         if match:
+            after_id = match.group(2)
+            pos_value = match.group(3)
             op = ApplyOp(
                 command=ApplyCommand.ADD_PAGE,
                 line_num=line_num,
                 parent=match.group(1),
-                title=match.group(2),
-                icon=match.group(3),
-                cover=match.group(4)
+                after=after_id,
+                position=pos_value,
+                title=match.group(4),
+                icon=match.group(5),
+                cover=match.group(6)
             )
-            # Collect content blocks
+            # Collect content blocks (code-block-aware)
             i += 1
             content_lines = []
+            in_code_block = False
+            code_fence_count = 0
             while i < len(lines):
                 content_line = lines[i]
-                if content_line and content_line[0] in ' \t':
+                if in_code_block:
                     content_lines.append(content_line)
+                    stripped_cl = content_line.lstrip()
+                    expected_close = '`' * code_fence_count
+                    if stripped_cl == expected_close:
+                        in_code_block = False
+                    i += 1
+                elif content_line and content_line[0] in ' \t':
+                    content_lines.append(content_line)
+                    stripped_cl = content_line.lstrip()
+                    fence_match = re.match(r'^(`{3,})\w*$', stripped_cl)
+                    if fence_match:
+                        in_code_block = True
+                        code_fence_count = len(fence_match.group(1))
                     i += 1
                 else:
                     break
@@ -3369,13 +3842,122 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
+        # +db parent=X title="Y" [icon=Z]
+        match = ADD_DB_PATTERN.match(line)
+        if match:
+            op = ApplyOp(
+                command=ApplyCommand.ADD_DB,
+                line_num=line_num,
+                parent=match.group(1),
+                title=match.group(2),
+                icon=match.group(3),
+            )
+            # Collect indented property definition lines
+            i += 1
+            has_title_prop = False
+            while i < len(lines):
+                prop_line = lines[i]
+                if not prop_line or prop_line[0] not in ' \t':
+                    break
+                stripped = prop_line.strip()
+                if not stripped or stripped.startswith('#'):
+                    i += 1
+                    continue
+                prop_def, prop_err = parse_property_def(stripped)
+                if prop_err:
+                    errors.append(DnnParseError(
+                        code="BAD_PROPERTY_DEF",
+                        message=prop_err,
+                        line=i,
+                        excerpt=f"{i}|{stripped[:60]}",
+                    ))
+                else:
+                    op.property_defs.append(prop_def)
+                    if prop_def.dnn_type == "title":
+                        has_title_prop = True
+                i += 1
+            if not has_title_prop and not errors:
+                errors.append(DnnParseError(
+                    code="MISSING_TITLE_PROPERTY",
+                    message="+db requires at least one title property",
+                    line=line_num,
+                    excerpt=f"{line_num}|{line[:60]}",
+                    suggestions=["Add a line like: Name(title)"]
+                ))
+            operations.append(op)
+            continue
+
+        # +prop db=X PropDef
+        match = ADD_PROP_PATTERN.match(line)
+        if match:
+            db_id = match.group(1)
+            prop_text = match.group(2).strip()
+            prop_def, prop_err = parse_property_def(prop_text)
+            if prop_err:
+                errors.append(DnnParseError(
+                    code="BAD_PROPERTY_DEF",
+                    message=prop_err,
+                    line=line_num,
+                    excerpt=f"{line_num}|{line[:60]}",
+                ))
+            else:
+                op = ApplyOp(
+                    command=ApplyCommand.ADD_PROP,
+                    line_num=line_num,
+                    database=db_id,
+                    property_def=prop_def,
+                )
+                operations.append(op)
+            i += 1
+            continue
+
+        # xprop db=X PropertyName
+        match = DELETE_PROP_PATTERN.match(line)
+        if match:
+            db_id = match.group(1)
+            prop_name = match.group(2).strip()
+            # Strip quotes if present
+            if prop_name.startswith('"') and prop_name.endswith('"'):
+                prop_name = prop_name[1:-1]
+            op = ApplyOp(
+                command=ApplyCommand.DELETE_PROP,
+                line_num=line_num,
+                database=db_id,
+                target=prop_name,
+            )
+            operations.append(op)
+            i += 1
+            continue
+
+        # uprop db=X OldName -> NewName
+        match = RENAME_PROP_PATTERN.match(line)
+        if match:
+            db_id = match.group(1)
+            old_name = match.group(2).strip()
+            new_name = match.group(3).strip()
+            # Strip quotes if present
+            if old_name.startswith('"') and old_name.endswith('"'):
+                old_name = old_name[1:-1]
+            if new_name.startswith('"') and new_name.endswith('"'):
+                new_name = new_name[1:-1]
+            op = ApplyOp(
+                command=ApplyCommand.RENAME_PROP,
+                line_num=line_num,
+                database=db_id,
+                old_name=old_name,
+                new_name=new_name,
+            )
+            operations.append(op)
+            i += 1
+            continue
+
         # Unknown command
         errors.append(DnnParseError(
             code="UNKNOWN_COMMAND",
             message="Unknown apply command",
             line=line_num,
             excerpt=f"{line_num}|{line[:50]}",
-            suggestions=["Valid commands: +, x, m, u, t, +page, mpage, xpage, upage, cpage, +row, urow, xrow"]
+            suggestions=["Valid commands: +, x, m, u, t, +page, mpage, xpage, upage, cpage, +row, urow, xrow, +db, +prop, xprop, uprop"]
         ))
         i += 1
 
@@ -3386,10 +3968,29 @@ def _parse_content_blocks(lines: list[str], errors: list[DnnParseError], start_l
     """Parse indented content lines into DNN blocks.
 
     Content blocks don't have IDs - they're new blocks to be created.
+    Handles code block state: backtick-counted fences collect raw lines
+    until a matching closing fence.
     """
     blocks = []
+    # Code block state
+    current_code_block: Optional[DnnBlock] = None
+    code_block_indent: int = 0
+    code_block_backtick_count: int = 3
+
     for offset, line in enumerate(lines):
         stripped = line.lstrip()
+
+        # CODE state: collect raw lines until closing fence
+        if current_code_block is not None:
+            expected_close = '`' * code_block_backtick_count
+            if stripped == expected_close:
+                # Closing fence — finalize code block
+                current_code_block = None
+                continue
+            # Raw content line (preserve as-is)
+            current_code_block.raw_lines.append(line)
+            continue
+
         if not stripped:
             continue
 
@@ -3410,7 +4011,84 @@ def _parse_content_blocks(lines: list[str], errors: list[DnnParseError], start_l
         )
         blocks.append(block)
 
+        # Enter CODE state if this is a code block
+        if block_type == 'code':
+            current_code_block = block
+            code_block_indent = indent
+            # Count backticks from the original line (content is empty for code blocks)
+            backtick_match = re.match(r'^(`{3,})', stripped)
+            code_block_backtick_count = len(backtick_match.group(1)) if backtick_match else 3
+            continue
+
+    # Handle unterminated code block
+    if current_code_block is not None:
+        closing_fence = '`' * code_block_backtick_count
+        errors.append(DnnParseError(
+            code="CODE_BLOCK_UNTERMINATED",
+            message="Code block not closed in content",
+            line=start_line + len(lines),
+            excerpt="EOF",
+            suggestions=[f"Add closing {closing_fence} at same indent level"],
+        ))
+
+    # Auto-group consecutive table_row blocks into a table parent.
+    # If table rows appear without an explicit !table N parent,
+    # wrap them in a synthetic table block.
+    blocks = _auto_group_table_rows(blocks)
+
     return blocks
+
+
+def _auto_group_table_rows(blocks: list[DnnBlock]) -> list[DnnBlock]:
+    """Auto-group consecutive table_row blocks into table parents.
+
+    Consecutive table_row blocks at the same level that don't already
+    have a table parent are wrapped in a synthetic !table N block.
+    Separator rows (table_separator) are silently dropped.
+    """
+    result = []
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+
+        # Drop separator rows
+        if block.block_type == 'table_separator':
+            i += 1
+            continue
+
+        # Check for consecutive table rows at same level
+        if block.block_type == 'table_row':
+            # Collect all consecutive table rows at this level
+            rows = []
+            level = block.level
+            while i < len(blocks) and blocks[i].level == level and \
+                    blocks[i].block_type in ('table_row', 'table_separator'):
+                if blocks[i].block_type == 'table_row':
+                    rows.append(blocks[i])
+                i += 1
+
+            # Infer table_width from first row's cell count
+            first_cells = parse_table_row_cells(rows[0].content)
+            table_width = len(first_cells)
+
+            # Create synthetic table parent
+            table_block = DnnBlock(
+                short_id="",
+                level=level,
+                block_type='table',
+                content=str(table_width),
+                structural=True,
+                children=rows,
+            )
+            # Adjust row levels to be children of the table
+            for row in rows:
+                row.level = level + 1
+            result.append(table_block)
+        else:
+            result.append(block)
+            i += 1
+
+    return result
 
 
 def _parse_row_values(line: str) -> dict[str, str]:
@@ -3537,6 +4215,38 @@ def dnn_block_to_notion(block: DnnBlock, registry: IdRegistry) -> dict:
                 "rich_text": [{"type": "text", "text": {"content": code_content}}],
                 "language": block.language or "plain text"
             }
+        }
+
+    elif block_type == "table":
+        # Table block — content is the column count, children are table_rows
+        table_width = int(block.content) if block.content else 0
+        row_children = []
+        for child in block.children:
+            if child.block_type == 'table_row':
+                row_children.append(dnn_block_to_notion(child, registry))
+            # Skip separator rows
+        return {
+            "type": "table",
+            "table": {
+                "table_width": table_width,
+                "has_column_header": len(row_children) > 0,
+                "has_row_header": False,
+                "children": row_children,
+            },
+        }
+
+    elif block_type == "table_row":
+        # Parse cells from pipe-delimited content
+        cells = parse_table_row_cells(block.content)
+        notion_cells = []
+        for cell_text in cells:
+            cell_rich_text = rich_text_spans_to_notion(
+                parse_inline_formatting(cell_text), registry
+            )
+            notion_cells.append(cell_rich_text)
+        return {
+            "type": "table_row",
+            "table_row": {"cells": notion_cells}
         }
 
     elif block_type == "child_page":
@@ -3782,6 +4492,17 @@ async def update_block_text_async(
 
     elif current_type == "code":
         update_payload["code"] = {"rich_text": rich_text}
+
+    elif current_type == "table_row":
+        # Parse pipe-delimited cells from new text
+        cells = parse_table_row_cells(clean_text)
+        notion_cells = []
+        for cell_text in cells:
+            cell_rich_text = rich_text_spans_to_notion(
+                parse_inline_formatting(cell_text), registry
+            )
+            notion_cells.append(cell_rich_text)
+        update_payload["table_row"] = {"cells": notion_cells}
 
     else:
         raise ValueError(f"Cannot update text of block type: {current_type}")
@@ -4275,7 +4996,6 @@ UNMOVABLE_BLOCK_TYPES = {
                     "Move the original content manually if you want an independent copy.",
     "link_preview": "Cannot move link_preview: integration-specific embed cannot be "
                     "recreated via API.",
-    "table": "Cannot move table: table structure requires matching row/column counts.",
     "table_of_contents": "Cannot move table_of_contents: positional block with no "
                          "portable content.",
     "breadcrumb": "Cannot move breadcrumb: positional block with no portable content.",
@@ -4689,6 +5409,25 @@ async def execute_apply_op(
 
             # Process regular blocks normally
             if regular_blocks:
+                # If parent is a table, unwrap auto-grouped table blocks
+                # back to raw table_rows (auto-grouping is wrong when
+                # explicitly adding rows to an existing table).
+                try:
+                    parent_block = await _notion_request_async(
+                        "GET", f"/blocks/{parent_uuid}"
+                    )
+                    if parent_block.get("type") == "table":
+                        unwrapped = []
+                        for b in regular_blocks:
+                            if b.block_type == "table" and not b.short_id:
+                                # Synthetic table from auto-grouping — unwrap
+                                unwrapped.extend(b.children)
+                            else:
+                                unwrapped.append(b)
+                        regular_blocks = unwrapped
+                except Exception:
+                    pass  # If fetch fails, proceed with original blocks
+
                 notion_blocks = build_block_tree(regular_blocks, registry)
                 num_created = len(notion_blocks)
 
@@ -4729,6 +5468,22 @@ async def execute_apply_op(
             target_uuid, err = _resolve_or_error(registry, target_id, "target")
             if err:
                 return {}, err
+
+            # Check if it's a page-backed block (child_page/child_database)
+            # — auto-route to page title update, same pattern as m→mpage
+            block = await _notion_request_async("GET", f"/blocks/{target_uuid}")
+            block_type = block.get("type", "")
+            if block_type in ("child_page", "child_database"):
+                page_id = block.get(block_type, {}).get("id", target_uuid)
+                title = op.new_text or ""
+                try:
+                    await _notion_request_async(
+                        "PATCH", f"/pages/{page_id}",
+                        json_body={"properties": {"title": {"title": _text_to_rich_text(title, registry)}}}
+                    )
+                except httpx.HTTPStatusError as e:
+                    return {}, f"Page title update failed: {_http_error_detail(e)}"
+                return {"op": "u", "updated": op.target}, None
 
             _, new_short_id = await update_block_text_async(
                 target_uuid, op.new_text or "", registry=registry
@@ -4992,6 +5747,19 @@ async def execute_apply_op(
             if op.cover:
                 page_body["cover"] = {"type": "external", "external": {"url": op.cover}}
 
+            # Add position if after= or pos= specified
+            if op.after:
+                after_uuid_val = _remap_id(op.after, id_map)
+                after_resolved, after_err = _resolve_or_error(registry, after_uuid_val, "after block")
+                if after_err:
+                    return {}, after_err
+                page_body["position"] = {
+                    "type": "after_block",
+                    "after_block": {"id": after_resolved}
+                }
+            elif op.position == "start":
+                page_body["position"] = {"type": "page_start"}
+
             try:
                 new_page = await _notion_request_async("POST", "/pages", json_body=page_body)
             except httpx.HTTPStatusError as e:
@@ -5172,6 +5940,201 @@ async def execute_apply_op(
             if copy_warnings:
                 result["warnings"] = copy_warnings
             return result, None
+
+        elif op.command == ApplyCommand.ADD_DB:
+            # Create a new database
+            parent_id = _remap_id(op.parent, id_map)
+            parent_uuid, err = _resolve_or_error(registry, parent_id, "parent")
+            if err:
+                return {}, err
+
+            if not op.property_defs:
+                return {}, "+db: no property definitions provided"
+
+            # Build properties schema
+            properties: dict = {}
+            for prop_def in op.property_defs:
+                notion_schema = property_def_to_notion(prop_def)
+                # For relation properties, resolve target DB to data_source_id
+                if prop_def.api_type == "relation" and prop_def.relation_db:
+                    rel_uuid, rel_err = _resolve_or_error(
+                        registry, prop_def.relation_db, "relation target database"
+                    )
+                    if rel_err:
+                        return {}, f"+db property '{prop_def.name}': {rel_err}"
+                    target_ds_id, _, target_err = await _fetch_database_schema(rel_uuid)
+                    if target_err:
+                        return {}, f"+db property '{prop_def.name}' relation target: {target_err}"
+                    notion_schema["relation"].pop("database_id", None)
+                    notion_schema["relation"]["data_source_id"] = target_ds_id
+                properties[prop_def.name] = notion_schema
+
+            # Build database body
+            db_body: dict = {
+                "parent": {"type": "page_id", "page_id": parent_uuid},
+                "title": [{"type": "text", "text": {"content": op.title or "Untitled"}}],
+                "is_inline": False,
+                "initial_data_source": {
+                    "type": "external",
+                    "external": {},
+                    "properties": properties,
+                },
+            }
+
+            # Add icon if provided
+            if op.icon:
+                if op.icon.startswith("http"):
+                    db_body["icon"] = {"type": "external", "external": {"url": op.icon}}
+                else:
+                    db_body["icon"] = {"type": "emoji", "emoji": op.icon}
+
+            try:
+                result = await _notion_request_async(
+                    "POST", "/databases", json_body=db_body
+                )
+            except httpx.HTTPStatusError as e:
+                return {}, f"Database creation failed: {_http_error_detail(e)}"
+
+            db_id = result.get("id", "")
+            short_id = registry.register(db_id) if db_id else ""
+
+            return {"op": "+db", "created": short_id}, None
+
+        elif op.command == ApplyCommand.ADD_PROP:
+            # Add a property to an existing database
+            db_id = _remap_id(op.database, id_map)
+            db_uuid, err = _resolve_or_error(registry, db_id, "database")
+            if err:
+                return {}, err
+
+            if not op.property_def:
+                return {}, "+prop: no property definition provided"
+
+            prop_def = op.property_def
+            notion_schema = property_def_to_notion(prop_def)
+
+            # Fetch data source ID for the database being modified
+            data_source_id, _, schema_err = await _fetch_database_schema(db_uuid)
+            if schema_err:
+                return {}, f"+prop: {schema_err}"
+
+            # For relation, resolve target DB to its data source ID
+            # PATCH /data_sources requires data_source_id, not database_id
+            if prop_def.api_type == "relation" and prop_def.relation_db:
+                rel_uuid, rel_err = _resolve_or_error(
+                    registry, prop_def.relation_db, "relation target database"
+                )
+                if rel_err:
+                    return {}, f"+prop: {rel_err}"
+                target_ds_id, _, target_err = await _fetch_database_schema(rel_uuid)
+                if target_err:
+                    return {}, f"+prop relation target: {target_err}"
+                # Replace database_id placeholder with actual data_source_id
+                notion_schema["relation"].pop("database_id", None)
+                notion_schema["relation"]["data_source_id"] = target_ds_id
+
+            # PATCH data source to add property
+            patch_body = {
+                "properties": {
+                    prop_def.name: notion_schema
+                }
+            }
+            try:
+                await _notion_request_async(
+                    "PATCH", f"/data_sources/{data_source_id}",
+                    json_body=patch_body
+                )
+            except httpx.HTTPStatusError as e:
+                return {}, f"Add property failed: {_http_error_detail(e)}"
+
+            return {"op": "+prop", "database": op.database, "added": prop_def.name}, None
+
+        elif op.command == ApplyCommand.DELETE_PROP:
+            # Delete a property from a database
+            db_id = _remap_id(op.database, id_map)
+            db_uuid, err = _resolve_or_error(registry, db_id, "database")
+            if err:
+                return {}, err
+
+            prop_name = op.target
+            if not prop_name:
+                return {}, "xprop: no property name provided"
+
+            # Fetch data source and verify property exists
+            data_source_id, db_properties, schema_err = await _fetch_database_schema(db_uuid)
+            if schema_err:
+                return {}, f"xprop: {schema_err}"
+
+            # Find the property (case-insensitive match)
+            actual_name = None
+            for pname, pdef in db_properties.items():
+                if pname.strip().lower() == prop_name.lower():
+                    # Cannot delete title property
+                    if pdef.get("type") == "title":
+                        return {}, f"xprop: cannot delete title property '{pname}'"
+                    actual_name = pname
+                    break
+
+            if not actual_name:
+                return {}, f"xprop: property '{prop_name}' not found in database"
+
+            # PATCH data source to delete property (set to None)
+            patch_body = {
+                "properties": {
+                    actual_name: None
+                }
+            }
+            try:
+                await _notion_request_async(
+                    "PATCH", f"/data_sources/{data_source_id}",
+                    json_body=patch_body
+                )
+            except httpx.HTTPStatusError as e:
+                return {}, f"Delete property failed: {_http_error_detail(e)}"
+
+            return {"op": "xprop", "database": op.database, "deleted": actual_name}, None
+
+        elif op.command == ApplyCommand.RENAME_PROP:
+            # Rename a property in a database
+            db_id = _remap_id(op.database, id_map)
+            db_uuid, err = _resolve_or_error(registry, db_id, "database")
+            if err:
+                return {}, err
+
+            if not op.old_name or not op.new_name:
+                return {}, "uprop: old and new property names required"
+
+            # Fetch data source and verify property exists
+            data_source_id, db_properties, schema_err = await _fetch_database_schema(db_uuid)
+            if schema_err:
+                return {}, f"uprop: {schema_err}"
+
+            # Find the property (case-insensitive match)
+            actual_name = None
+            for pname in db_properties:
+                if pname.strip().lower() == op.old_name.lower():
+                    actual_name = pname
+                    break
+
+            if not actual_name:
+                return {}, f"uprop: property '{op.old_name}' not found in database"
+
+            # PATCH data source to rename property
+            patch_body = {
+                "properties": {
+                    actual_name: {"name": op.new_name}
+                }
+            }
+            try:
+                await _notion_request_async(
+                    "PATCH", f"/data_sources/{data_source_id}",
+                    json_body=patch_body
+                )
+            except httpx.HTTPStatusError as e:
+                return {}, f"Rename property failed: {_http_error_detail(e)}"
+
+            return {"op": "uprop", "database": op.database,
+                    "renamed": {op.old_name: op.new_name}}, None
 
         else:
             return {}, f"Command not implemented: {op.command.value}"
@@ -6023,14 +6986,20 @@ async def notion_search(
 
 @mcp.tool()
 async def notion_apply(
-    script: str,
+    script: str = "",
+    operations: str = "",
+    action: str = "",
     dry_run: bool = False,
     allow_partial: bool = False
 ) -> str:
     """Execute mutations on Notion pages.
 
+    PARAMETER: Use `script` (not `operations`, `action`, or `commands`).
+
     Args:
         script: Apply script with mutation commands. See examples below.
+        operations: Alias for script. Use one or the other, not both.
+        action: Alias for script. Use one or the other, not both.
         dry_run: If True, validate script without executing (default False).
         allow_partial: If True, continue on errors (default False).
 
@@ -6152,8 +7121,16 @@ async def notion_apply(
     """
     global _id_registry
 
+    # Resolve script/operations/action alias
+    provided = [name for name, val in [("script", script), ("operations", operations), ("action", action)] if val]
+    if not provided:
+        raise ValueError("Missing required parameter: script")
+    if len(provided) > 1:
+        raise ValueError(f"Use only one of script/operations/action, got: {', '.join(provided)}")
+    resolved = script or operations or action
+
     result = await execute_apply_script(
-        script,
+        resolved,
         _id_registry,
         dry_run=dry_run,
         allow_partial=allow_partial
@@ -6272,16 +7249,15 @@ def main():
         datefmt="%H:%M:%S"
     )
 
+    # Load token from file
     global _notion_token
     token_path = Path(args.token_file).expanduser()
     if not token_path.exists():
-        logger.error(f"Token file not found: {token_path}")
-        raise SystemExit(1)
+        raise SystemExit(f"Token file not found: {token_path}")
     _notion_token = token_path.read_text().strip()
     if not _notion_token:
-        logger.error("Token file is empty")
-        raise SystemExit(1)
-    logger.info(f"Notion token loaded from {token_path}")
+        raise SystemExit(f"Token file is empty: {token_path}")
+    logger.info(f"Loaded Notion token from {token_path}")
 
     if args.http:
         # HTTP mode: standalone server with health/kill endpoints

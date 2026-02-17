@@ -7,6 +7,7 @@ from notion_mcp import (
     ApplyCommand,
     ApplyOp,
     BASE62_ALPHABET,
+    CALLOUT_COLORS,
     DnnBlock,
     DnnHeader,
     DnnParseError,
@@ -16,11 +17,14 @@ from notion_mcp import (
     FilterCompound,
     FilterParseError,
     IdRegistry,
+    OPAQUE_BLOCK_TYPES,
     ParseState,
     RichTextSpan,
     SHORT_ID_PATTERN,
+    STRUCTURAL_BLOCK_TYPES,
     UNMOVABLE_BLOCK_TYPES,
     UUID_PATTERN,
+    _auto_group_table_rows,
     _build_property_value,
     _build_row_properties,
     _check_movability,
@@ -35,8 +39,16 @@ from notion_mcp import (
     _reupload_notion_file,
     _text_to_rich_text,
     _tokenize_filter,
+    CREATABLE_PROPERTY_TYPES,
+    DNN_TO_API_TYPE,
+    PropertyDef,
+    parse_property_def,
+    property_def_to_notion,
     calculate_indent_level,
+    cells_to_pipe_row,
     compile_filter,
+    dnn_block_to_notion,
+    execute_apply_op,
     extract_uuid_from_url,
     fetch_database_async,
     fetch_data_source_async,
@@ -50,6 +62,8 @@ from notion_mcp import (
     parse_filter_dsl,
     parse_inline_formatting,
     parse_sort_dsl,
+    parse_table_row_cells,
+    render_block_to_dnn,
     rich_text_spans_to_notion,
     strip_marker_for_block,
 )
@@ -749,6 +763,189 @@ E5f6 After divider"""
 C3d4 Second"""
         result = parse_dnn(dnn)
         assert len(result.blocks) == 2
+
+
+class TestBacktickCounting:
+    """Test backtick counting for code blocks with inner fences."""
+
+    def test_code_block_with_inner_triple_backticks(self):
+        """Code block containing ``` should parse correctly with 4-backtick delimiters."""
+        dnn = "A1b2 ````markdown\nHere is code:\n```python\nx = 1\n```\nDone.\n````\nC3d4 After"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].block_type == "code"
+        assert result.blocks[0].language == "markdown"
+        assert len(result.blocks[0].raw_lines) == 5
+        assert "```python" in result.blocks[0].raw_lines[1]
+        assert "```" in result.blocks[0].raw_lines[3]
+        assert result.blocks[1].block_type == "paragraph"
+        assert result.blocks[1].content == "After"
+
+    def test_code_block_with_inner_quad_backticks(self):
+        """Code block containing ```` should use 5-backtick delimiters."""
+        dnn = "A1b2 `````text\nSome ````code```` here\n`````\nC3d4 After"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].block_type == "code"
+        assert "````code````" in result.blocks[0].raw_lines[0]
+        assert result.blocks[1].content == "After"
+
+    def test_code_block_nested_fences(self):
+        """Markdown document with multiple code fences inside a code block."""
+        dnn = (
+            "A1b2 ````markdown\n"
+            "# Example\n"
+            "```python\n"
+            "print('hello')\n"
+            "```\n"
+            "And another:\n"
+            "```bash\n"
+            "echo hi\n"
+            "```\n"
+            "````\n"
+            "C3d4 Next"
+        )
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].block_type == "code"
+        assert len(result.blocks[0].raw_lines) == 8
+        # Verify inner fences are preserved as raw content
+        assert result.blocks[0].raw_lines[1] == "```python"
+        assert result.blocks[0].raw_lines[3] == "```"
+        assert result.blocks[0].raw_lines[5] == "```bash"
+        assert result.blocks[0].raw_lines[7] == "```"
+
+    def test_code_block_three_backticks_unchanged(self):
+        """Standard 3-backtick code blocks still work identically."""
+        dnn = "A1b2 ```python\ndef foo():\n    pass\n```\nC3d4 After"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].block_type == "code"
+        assert result.blocks[0].language == "python"
+        assert result.blocks[0].raw_lines == ["def foo():", "    pass"]
+
+    def test_code_block_backtick_counting_edge_empty(self):
+        """Empty code block with various backtick counts."""
+        for n in [3, 4, 5, 6]:
+            fence = '`' * n
+            dnn = f"A1b2 {fence}python\n{fence}\nC3d4 After"
+            result = parse_dnn(dnn)
+            assert len(result.errors) == 0, f"Failed with {n} backticks"
+            assert len(result.blocks) == 2, f"Failed with {n} backticks"
+            assert result.blocks[0].block_type == "code"
+            assert result.blocks[0].raw_lines == []
+
+    def test_code_block_fewer_backticks_dont_close(self):
+        """Fewer backticks than the opening don't close the block."""
+        dnn = "A1b2 ````python\n```\nstill inside\n````\nC3d4 After"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].raw_lines == ["```", "still inside"]
+
+    def test_code_block_more_backticks_dont_close(self):
+        """More backticks than the opening don't close the block."""
+        dnn = "A1b2 ```python\n````\nstill inside\n```\nC3d4 After"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 2
+        assert result.blocks[0].raw_lines == ["````", "still inside"]
+
+    def test_unterminated_with_backtick_count(self):
+        """Unterminated code block error uses correct backtick count."""
+        dnn = "A1b2 ````python\nsome code"
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "CODE_BLOCK_UNTERMINATED"
+        assert "````" in result.errors[0].autofix["patched"]
+        assert "````" in result.errors[0].suggestions[0]
+        # Block should still be added
+        assert len(result.blocks) == 1
+        assert result.blocks[0].block_type == "code"
+
+    def test_render_code_block_no_backticks_in_content(self):
+        """Render uses 3 backticks when content has no backticks."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "code",
+            "code": {
+                "language": "python",
+                "rich_text": [{"plain_text": "x = 1"}]
+            },
+            "has_children": False,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "```python" in dnn
+        assert "````" not in dnn
+
+    def test_render_code_block_backtick_escalation(self):
+        """Render escalates to 4 backticks when content has triple backticks."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "code",
+            "code": {
+                "language": "markdown",
+                "rich_text": [{"plain_text": "```python\nx = 1\n```"}]
+            },
+            "has_children": False,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        # Should use 4 backticks for open/close
+        assert "````markdown" in dnn
+        assert dnn.endswith("````")
+        # Inner triple backticks should be preserved as-is
+        assert "```python" in dnn
+
+    def test_render_code_block_quad_backtick_escalation(self):
+        """Render escalates to 5 backticks when content has quad backticks."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "code",
+            "code": {
+                "language": "text",
+                "rich_text": [{"plain_text": "````\nsome code\n````"}]
+            },
+            "has_children": False,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "`````text" in dnn
+        assert dnn.endswith("`````")
+
+    def test_round_trip_code_block_with_fences(self):
+        """Full round-trip: Notion API → DNN → parse → verify content."""
+        registry = IdRegistry()
+        original_content = "# Example\n```python\nprint('hello')\n```\nDone."
+        block = {
+            "id": "00000000000000000000000000000002",
+            "type": "code",
+            "code": {
+                "language": "markdown",
+                "rich_text": [{"plain_text": original_content}]
+            },
+            "has_children": False,
+        }
+        # Render to DNN
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        # Parse back
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 1
+        assert result.blocks[0].block_type == "code"
+        assert result.blocks[0].language == "markdown"
+        # Reconstruct content from raw_lines
+        round_tripped = "\n".join(result.blocks[0].raw_lines)
+        assert round_tripped == original_content
 
 
 class TestParseBlockMarkerPrecedence:
@@ -2522,12 +2719,11 @@ class TestCheckMovability:
         assert error is not None
         assert "integration-specific" in error
 
-    def test_table_is_unmovable(self):
-        """table block is refused."""
+    def test_table_is_movable(self):
+        """table block is movable (clone+archive)."""
         block = {"type": "table", "table": {}}
         warnings, error = _check_movability(block)
-        assert error is not None
-        assert "table structure" in error
+        assert error is None
 
     def test_table_of_contents_is_unmovable(self):
         block = {"type": "table_of_contents", "table_of_contents": {}}
@@ -2979,3 +3175,1368 @@ class TestIdentifyMoveChains:
             self._add_op("Z"),
         ]
         assert _identify_move_chains(ops) == [[1, 2, 3]]
+
+
+# =============================================================================
+# Update auto-routes to page title for page-backed blocks
+# =============================================================================
+
+
+class TestUpdateAutoRoutesForPageBacked:
+    """u command on child_page/child_database auto-routes to page title update."""
+
+    def test_u_on_child_page_updates_title(self, monkeypatch):
+        """u on a § block should PATCH the page title, not call update_block_text."""
+        import notion_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Old Title", "id": "page-uuid-1234"},
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "page-uuid-1234"}
+            return {}
+
+        monkeypatch.setattr(notion_mcp, "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["A1b2"] = "block-uuid-5678"
+        registry._uuid_to_short["block-uuid-5678"] = "A1b2"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="A1b2",
+            new_text="New Title",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None
+        assert result["op"] == "u"
+        assert result["updated"] == "A1b2"
+        # Should have called GET block, then PATCH page (not update_block_text)
+        assert patched_calls[0] == ("GET", "/blocks/block-uuid-5678", None)
+        assert patched_calls[1][0] == "PATCH"
+        assert "/pages/page-uuid-1234" in patched_calls[1][1]
+        title_rt = patched_calls[1][2]["properties"]["title"]["title"]
+        assert title_rt[0]["text"]["content"] == "New Title"
+
+    def test_u_on_child_database_updates_title(self, monkeypatch):
+        """u on a ⊞ block should PATCH the page title."""
+        import notion_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Old DB", "id": "db-uuid-9999"},
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "db-uuid-9999"}
+            return {}
+
+        monkeypatch.setattr(notion_mcp, "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["B2c3"] = "block-uuid-aaaa"
+        registry._uuid_to_short["block-uuid-aaaa"] = "B2c3"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="B2c3",
+            new_text="Renamed Database",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None
+        assert result["op"] == "u"
+        assert patched_calls[1][0] == "PATCH"
+        assert "/pages/db-uuid-9999" in patched_calls[1][1]
+
+    def test_u_on_regular_block_still_works(self, monkeypatch):
+        """u on a paragraph block should NOT take the page-title path."""
+        import notion_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": "old"}}]},
+                }
+            if method == "PATCH" and "/blocks/" in endpoint:
+                return {"type": "paragraph"}
+            return {}
+
+        monkeypatch.setattr(notion_mcp, "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["C3d4"] = "block-uuid-bbbb"
+        registry._uuid_to_short["block-uuid-bbbb"] = "C3d4"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="C3d4",
+            new_text="updated text",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None
+        assert result["op"] == "u"
+        # Should have called PATCH on blocks, not pages
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        assert "/blocks/" in patch_calls[0][1]
+
+
+# =============================================================================
+# Table and ! Prefix Tests
+# =============================================================================
+
+
+class TestOpaqueBlockRendering:
+    """All opaque blocks render with ~ suffix."""
+
+    def test_opaque_blocks_all_have_tilde(self):
+        """Every opaque type renders as !type~ in DNN."""
+        registry = IdRegistry()
+        for opaque_type in OPAQUE_BLOCK_TYPES:
+            block = {
+                "id": "00000000000000000000000000000001",
+                "type": opaque_type,
+                opaque_type: {},
+                "has_children": False,
+            }
+            lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+            dnn = " ".join(lines)
+            assert f"!{opaque_type}~" in dnn, (
+                f"Opaque type '{opaque_type}' should render with ~ suffix"
+            )
+
+    def test_opaque_block_with_caption(self):
+        """Opaque block with caption includes it in parens."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "image",
+            "image": {
+                "caption": [{"type": "text",
+                             "text": {"content": "A photo"},
+                             "plain_text": "A photo", "annotations": {
+                    "bold": False, "italic": False, "strikethrough": False,
+                    "underline": False, "code": False, "color": "default",
+                }}],
+            },
+            "has_children": False,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = " ".join(lines)
+        assert "!image~" in dnn
+        assert "(A photo)" in dnn
+
+
+class TestStructuralBlockMarkers:
+    """Structural blocks parse and render with !type N syntax."""
+
+    def test_structural_block_table_marker(self):
+        """!table 3 parses as table with structural flag."""
+        btype, content, attrs, warnings = parse_block_type("!table 3")
+        assert btype == "table"
+        assert content == "3"
+        assert attrs.get("structural") is True
+        assert warnings == []
+
+    def test_structural_block_cols_marker(self):
+        """!cols 3 parses as column_list."""
+        btype, content, attrs, warnings = parse_block_type("!cols 3")
+        assert btype == "column_list"
+        assert content == "3"
+        assert attrs.get("structural") is True
+
+    def test_structural_block_col_marker(self):
+        """!col 1 parses as column."""
+        btype, content, attrs, warnings = parse_block_type("!col 1")
+        assert btype == "column"
+        assert content == "1"
+        assert attrs.get("structural") is True
+
+    def test_structural_unknown_type_falls_through(self):
+        """!unknown 5 is NOT structural — falls through to default callout."""
+        btype, content, attrs, warnings = parse_block_type("!unknown 5")
+        # Falls through to default callout since "! unknown 5" doesn't match
+        # (no space after !) — actually "!unknown 5" matches neither colored
+        # callout nor opaque nor structural, and ! with no space is not
+        # default callout, so it becomes paragraph
+        assert btype == "paragraph"
+
+
+class TestBangDisambiguation:
+    """Test ! prefix disambiguation order."""
+
+    def test_colored_callout(self):
+        """!red text → colored callout."""
+        btype, content, attrs, _ = parse_block_type("!red Important warning")
+        assert btype == "callout"
+        assert content == "Important warning"
+        assert attrs["color"] == "red_background"
+
+    def test_all_callout_colors(self):
+        """All callout colors are recognized."""
+        for color in CALLOUT_COLORS:
+            btype, content, attrs, _ = parse_block_type(f"!{color} text")
+            assert btype == "callout", f"!{color} should be callout"
+            assert attrs["color"] == f"{color}_background"
+
+    def test_opaque_block(self):
+        """!image~ → opaque block."""
+        btype, content, attrs, _ = parse_block_type("!image~")
+        assert btype == "image"
+        assert attrs.get("opaque") is True
+
+    def test_opaque_block_with_caption(self):
+        """!image~ (caption text) → opaque block with caption."""
+        btype, content, attrs, _ = parse_block_type("!image~ (My photo)")
+        assert btype == "image"
+        assert content == "My photo"
+        assert attrs.get("opaque") is True
+
+    def test_structural_block(self):
+        """!table 3 → structural table block."""
+        btype, content, attrs, _ = parse_block_type("!table 3")
+        assert btype == "table"
+        assert attrs.get("structural") is True
+
+    def test_default_callout(self):
+        """! text → default callout (fallback)."""
+        btype, content, attrs, _ = parse_block_type("! Important note")
+        assert btype == "callout"
+        assert content == "Important note"
+        assert attrs.get("color") == "default"
+
+    def test_bang_escape(self):
+        r"""\! text → paragraph with literal !."""
+        btype, content, attrs, _ = parse_block_type("\\! not a callout")
+        assert btype == "paragraph"
+        assert content == "! not a callout"
+
+    def test_color_takes_priority_over_opaque(self):
+        """Color names and opaque types don't overlap, but verify order."""
+        # 'red' is a color, not an opaque type
+        btype, _, attrs, _ = parse_block_type("!red some text")
+        assert btype == "callout"
+        assert attrs["color"] == "red_background"
+
+    def test_opaque_takes_priority_over_structural(self):
+        """An opaque type with ~ is opaque, not structural."""
+        btype, _, attrs, _ = parse_block_type("!image~")
+        assert btype == "image"
+        assert attrs.get("opaque") is True
+
+
+class TestTableRowVsQuote:
+    """Test disambiguation between table rows and quotes."""
+
+    def test_table_row_trailing_pipe(self):
+        """| cell | cell | (trailing pipe) → table_row."""
+        btype, content, attrs, _ = parse_block_type("| Alice | 30 | NYC |")
+        assert btype == "table_row"
+
+    def test_quote_no_trailing_pipe(self):
+        """| text (no trailing pipe) → quote."""
+        btype, content, attrs, _ = parse_block_type("| This is a quote")
+        assert btype == "quote"
+        assert content == "This is a quote"
+
+    def test_single_cell_table_row(self):
+        """| cell | → table row with single cell."""
+        btype, content, attrs, _ = parse_block_type("| single |")
+        assert btype == "table_row"
+
+    def test_separator_row(self):
+        """|---|---| → table_separator (silently dropped)."""
+        btype, content, attrs, _ = parse_block_type("|---|---|")
+        assert btype == "table_separator"
+
+    def test_separator_row_with_colons(self):
+        """|:---|:---:| → table_separator."""
+        btype, content, attrs, _ = parse_block_type("|:---|:---:|")
+        assert btype == "table_separator"
+
+    def test_separator_row_spaces(self):
+        """| --- | --- | → table_separator."""
+        btype, content, attrs, _ = parse_block_type("| --- | --- |")
+        assert btype == "table_separator"
+
+
+class TestParseTableRowCells:
+    """Tests for parse_table_row_cells helper."""
+
+    def test_basic_cells(self):
+        cells = parse_table_row_cells("| Name | Age | City |")
+        assert cells == ["Name", "Age", "City"]
+
+    def test_single_cell(self):
+        cells = parse_table_row_cells("| single |")
+        assert cells == ["single"]
+
+    def test_empty_cells(self):
+        cells = parse_table_row_cells("|  |  |  |")
+        assert cells == ["", "", ""]
+
+    def test_escaped_pipe_in_cell(self):
+        r"""Cell with \| should preserve literal pipe."""
+        cells = parse_table_row_cells(r"| A \| B | C |")
+        assert cells == ["A | B", "C"]
+
+    def test_whitespace_stripping(self):
+        cells = parse_table_row_cells("|  Alice  |  30  |")
+        assert cells == ["Alice", "30"]
+
+
+class TestCellsToPipeRow:
+    """Tests for cells_to_pipe_row helper."""
+
+    def test_basic_cells(self):
+        result = cells_to_pipe_row(["Name", "Age", "City"])
+        assert result == "| Name | Age | City |"
+
+    def test_single_cell(self):
+        result = cells_to_pipe_row(["single"])
+        assert result == "| single |"
+
+    def test_escapes_pipes(self):
+        result = cells_to_pipe_row(["A | B", "C"])
+        assert result == r"| A \| B | C |"
+
+    def test_round_trip_with_parse(self):
+        """cells_to_pipe_row → parse_table_row_cells round-trips."""
+        original = ["Name", "Age | Years", "City"]
+        row = cells_to_pipe_row(original)
+        parsed = parse_table_row_cells(row)
+        assert parsed == original
+
+
+class TestRenderTableToDnn:
+    """Tests for rendering Notion table blocks to DNN."""
+
+    def test_render_table_basic(self):
+        """Simple table renders with !table N and pipe rows."""
+        registry = IdRegistry()
+        block = _make_notion_table([
+            ["Name", "Age", "City"],
+            ["Alice", "30", "NYC"],
+            ["Bob", "25", "SF"],
+        ])
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "!table 3" in dnn
+        assert "| Name | Age | City |" in dnn
+        assert "| Alice | 30 | NYC |" in dnn
+        assert "| Bob | 25 | SF |" in dnn
+
+    def test_render_table_with_pipe_in_cell(self):
+        r"""Pipe chars in cell content are escaped as \|."""
+        registry = IdRegistry()
+        block = _make_notion_table([
+            ["Col1", "Col2"],
+            ["A | B", "C"],
+        ])
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert r"A \| B" in dnn
+
+    def test_render_table_empty_cells(self):
+        """Empty cells render correctly."""
+        registry = IdRegistry()
+        block = _make_notion_table([
+            ["Name", "Notes"],
+            ["Alice", ""],
+        ])
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "| Alice |  |" in dnn or "| Alice | |" in dnn
+
+    def test_render_table_single_column(self):
+        """Single-column table works."""
+        registry = IdRegistry()
+        block = _make_notion_table([
+            ["Item"],
+            ["Apple"],
+            ["Banana"],
+        ], table_width=1)
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "!table 1" in dnn
+        assert "| Item |" in dnn
+        assert "| Apple |" in dnn
+
+    def test_render_table_with_formatting(self):
+        """Cells with rich text formatting render inline DNN."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "table",
+            "table": {"table_width": 2, "has_column_header": True,
+                      "has_row_header": False},
+            "_children": [
+                {
+                    "id": "00000000000000000000000000000002",
+                    "type": "table_row",
+                    "table_row": {
+                        "cells": [
+                            [_rt("Bold", bold=True)],
+                            [_rt("Normal")],
+                        ]
+                    },
+                    "has_children": False,
+                }
+            ],
+            "has_children": True,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "**Bold**" in dnn
+        assert "Normal" in dnn
+
+
+class TestParseTableDnn:
+    """Tests for parsing DNN table syntax back to blocks."""
+
+    def test_parse_table_basic(self):
+        """!table N with child rows parses correctly.
+
+        parse_dnn returns a flat list; rows are children by level.
+        """
+        dnn = (
+            "A1b2 !table 3\n"
+            "C3d4   | Name | Age | City |\n"
+            "E5f6   | Alice | 30 | NYC |"
+        )
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 3
+        assert result.blocks[0].block_type == "table"
+        assert result.blocks[0].content == "3"
+        assert result.blocks[0].structural is True
+        assert result.blocks[0].level == 0
+        assert result.blocks[1].block_type == "table_row"
+        assert result.blocks[1].level == 1
+        assert result.blocks[2].block_type == "table_row"
+        assert result.blocks[2].level == 1
+
+    def test_parse_table_row_content_preserved(self):
+        """Table row content is the raw pipe-delimited string."""
+        dnn = (
+            "A1b2 !table 2\n"
+            "C3d4   | Name | Age |"
+        )
+        result = parse_dnn(dnn)
+        row = result.blocks[1]  # Flat list: index 1 is first row
+        assert row.block_type == "table_row"
+        cells = parse_table_row_cells(row.content)
+        assert cells == ["Name", "Age"]
+
+    def test_parse_table_empty_cells(self):
+        """Table with empty cells parses correctly."""
+        dnn = (
+            "A1b2 !table 2\n"
+            "C3d4   | Name | |\n"
+            "E5f6   |  | Age |"
+        )
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        row1 = result.blocks[1]
+        cells1 = parse_table_row_cells(row1.content)
+        assert cells1 == ["Name", ""]
+        row2 = result.blocks[2]
+        cells2 = parse_table_row_cells(row2.content)
+        assert cells2 == ["", "Age"]
+
+
+class TestTableAutoGrouping:
+    """Tests for _auto_group_table_rows."""
+
+    def test_consecutive_rows_auto_group(self):
+        """Bare pipe rows are grouped into a table parent."""
+        blocks = [
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| A | B |"),
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| C | D |"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 1
+        assert result[0].block_type == "table"
+        assert result[0].content == "2"  # 2 columns
+        assert len(result[0].children) == 2
+
+    def test_separator_rows_dropped(self):
+        """Separator rows (|---|---|) are silently dropped."""
+        blocks = [
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| Name | Age |"),
+            DnnBlock(short_id="", level=0, block_type="table_separator",
+                     content=""),
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| Alice | 30 |"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 1
+        assert result[0].block_type == "table"
+        assert len(result[0].children) == 2  # Separator dropped
+
+    def test_non_table_blocks_unchanged(self):
+        """Non-table blocks pass through unchanged."""
+        blocks = [
+            DnnBlock(short_id="", level=0, block_type="paragraph",
+                     content="Hello"),
+            DnnBlock(short_id="", level=0, block_type="paragraph",
+                     content="World"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 2
+        assert result[0].block_type == "paragraph"
+        assert result[1].block_type == "paragraph"
+
+    def test_mixed_blocks_with_table(self):
+        """Table rows amid other blocks are grouped correctly."""
+        blocks = [
+            DnnBlock(short_id="", level=0, block_type="paragraph",
+                     content="Before"),
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| A | B |"),
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| C | D |"),
+            DnnBlock(short_id="", level=0, block_type="paragraph",
+                     content="After"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 3
+        assert result[0].block_type == "paragraph"
+        assert result[1].block_type == "table"
+        assert len(result[1].children) == 2
+        assert result[2].block_type == "paragraph"
+
+    def test_table_width_inferred_from_first_row(self):
+        """Table width comes from cell count of first row."""
+        blocks = [
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| A | B | C | D |"),
+            DnnBlock(short_id="", level=0, block_type="table_row",
+                     content="| 1 | 2 | 3 | 4 |"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert result[0].content == "4"  # 4 columns
+
+
+class TestDnnBlockToNotionTable:
+    """Tests for dnn_block_to_notion with table blocks."""
+
+    def test_table_to_notion_basic(self):
+        """Table block converts to Notion API format."""
+        registry = IdRegistry()
+        row1 = DnnBlock(short_id="", level=1, block_type="table_row",
+                        content="| Name | Age |")
+        row2 = DnnBlock(short_id="", level=1, block_type="table_row",
+                        content="| Alice | 30 |")
+        table = DnnBlock(short_id="", level=0, block_type="table",
+                         content="2", structural=True, children=[row1, row2])
+        notion = dnn_block_to_notion(table, registry)
+        assert notion["type"] == "table"
+        assert notion["table"]["table_width"] == 2
+        assert notion["table"]["has_column_header"] is True
+        assert len(notion["table"]["children"]) == 2
+
+    def test_table_row_to_notion(self):
+        """Table row converts cells to rich_text arrays."""
+        registry = IdRegistry()
+        row = DnnBlock(short_id="", level=1, block_type="table_row",
+                       content="| Alice | 30 | NYC |")
+        notion = dnn_block_to_notion(row, registry)
+        assert notion["type"] == "table_row"
+        cells = notion["table_row"]["cells"]
+        assert len(cells) == 3
+        # Each cell is a list of rich_text spans (write format uses text.content)
+        assert cells[0][0]["text"]["content"] == "Alice"
+        assert cells[1][0]["text"]["content"] == "30"
+        assert cells[2][0]["text"]["content"] == "NYC"
+
+    def test_table_single_row(self):
+        """Single-row table works."""
+        registry = IdRegistry()
+        row = DnnBlock(short_id="", level=1, block_type="table_row",
+                       content="| Only Row |")
+        table = DnnBlock(short_id="", level=0, block_type="table",
+                         content="1", structural=True, children=[row])
+        notion = dnn_block_to_notion(table, registry)
+        assert len(notion["table"]["children"]) == 1
+
+    def test_table_row_with_inline_formatting(self):
+        """Table row with bold text in cells."""
+        registry = IdRegistry()
+        row = DnnBlock(short_id="", level=1, block_type="table_row",
+                       content="| **Bold** | Normal |")
+        notion = dnn_block_to_notion(row, registry)
+        cells = notion["table_row"]["cells"]
+        # First cell should have bold formatting
+        assert len(cells) == 2
+        assert cells[0][0]["annotations"]["bold"] is True
+        # Second cell: plain text (no annotations key, or bold=False)
+        assert cells[1][0].get("annotations", {}).get("bold") is not True
+
+
+def _rt(text, bold=False, italic=False):
+    """Helper: create a Notion rich_text item for test data."""
+    return {
+        "type": "text",
+        "text": {"content": text},
+        "plain_text": text,
+        "annotations": {
+            "bold": bold, "italic": italic,
+            "strikethrough": False, "underline": False,
+            "code": False, "color": "default",
+        },
+    }
+
+
+def _make_notion_table(rows, table_width=None):
+    """Helper: create a Notion table block with plain-text rows."""
+    if table_width is None:
+        table_width = len(rows[0]) if rows else 0
+    children = []
+    for i, row in enumerate(rows):
+        cells = [[_rt(cell)] for cell in row]
+        children.append({
+            "id": f"0000000000000000000000000000{i+2:04d}",
+            "type": "table_row",
+            "table_row": {"cells": cells},
+            "has_children": False,
+        })
+    return {
+        "id": "00000000000000000000000000000001",
+        "type": "table",
+        "table": {
+            "table_width": table_width,
+            "has_column_header": True,
+            "has_row_header": False,
+        },
+        "_children": children,
+        "has_children": True,
+    }
+
+
+class TestTableRoundTrip:
+    """Round-trip tests: Notion → DNN → parse → verify."""
+
+    def test_basic_round_trip(self):
+        """Read a table, render to DNN, parse back — structure matches."""
+        registry = IdRegistry()
+        table_block = _make_notion_table([
+            ["Name", "Age", "City"],
+            ["Alice", "30", "NYC"],
+        ])
+
+        # Render to DNN
+        lines = render_block_to_dnn(table_block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+
+        # Parse back (parse_dnn returns flat list with levels)
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        assert len(result.blocks) == 3  # table + 2 rows (flat)
+
+        assert result.blocks[0].block_type == "table"
+        assert result.blocks[0].content == "3"
+        assert result.blocks[0].level == 0
+
+        # Verify cell content from rows
+        row1_cells = parse_table_row_cells(result.blocks[1].content)
+        assert row1_cells == ["Name", "Age", "City"]
+        row2_cells = parse_table_row_cells(result.blocks[2].content)
+        assert row2_cells == ["Alice", "30", "NYC"]
+
+    def test_round_trip_with_escaped_pipes(self):
+        r"""Table with pipe chars in cells round-trips correctly."""
+        registry = IdRegistry()
+        table_block = _make_notion_table([["A | B", "C"]])
+
+        lines = render_block_to_dnn(table_block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+
+        result = parse_dnn(dnn)
+        assert len(result.errors) == 0
+        # Flat list: blocks[0] = table, blocks[1] = row
+        row_cells = parse_table_row_cells(result.blocks[1].content)
+        assert row_cells == ["A | B", "C"]
+
+
+class TestColumnMarkersMigration:
+    """Verify column markers use new !cols/!col syntax."""
+
+    def test_column_list_renders_cols(self):
+        """column_list renders as !cols N."""
+        registry = IdRegistry()
+        block = {
+            "id": "00000000000000000000000000000001",
+            "type": "column_list",
+            "column_list": {},
+            "_children": [
+                {
+                    "id": "00000000000000000000000000000002",
+                    "type": "column",
+                    "column": {},
+                    "_children": [],
+                    "has_children": False,
+                },
+                {
+                    "id": "00000000000000000000000000000003",
+                    "type": "column",
+                    "column": {},
+                    "_children": [],
+                    "has_children": False,
+                },
+            ],
+            "has_children": True,
+        }
+        lines = render_block_to_dnn(block, registry, level=0, mode="edit")
+        dnn = "\n".join(lines)
+        assert "!cols 2" in dnn
+        assert "!col 1" in dnn
+        assert "!col 2" in dnn
+        # Old Unicode markers should NOT appear
+        assert "⫼" not in dnn
+        assert "║" not in dnn
+
+
+# =============================================================================
+# Property Definition Parser Tests
+# =============================================================================
+
+
+class TestParsePropertyDef:
+    """Tests for parse_property_def — Name(type: config) syntax."""
+
+    # --- Basic types (no config) ---
+
+    def test_title(self):
+        prop, err = parse_property_def("Name(title)")
+        assert err is None
+        assert prop.name == "Name"
+        assert prop.dnn_type == "title"
+        assert prop.api_type == "title"
+
+    def test_text(self):
+        prop, err = parse_property_def("Description(text)")
+        assert err is None
+        assert prop.api_type == "rich_text"
+
+    def test_date(self):
+        prop, err = parse_property_def("Due(date)")
+        assert err is None
+        assert prop.api_type == "date"
+
+    def test_checkbox(self):
+        prop, err = parse_property_def("Done(checkbox)")
+        assert err is None
+        assert prop.api_type == "checkbox"
+
+    def test_url(self):
+        prop, err = parse_property_def("Website(url)")
+        assert err is None
+        assert prop.api_type == "url"
+
+    def test_email(self):
+        prop, err = parse_property_def("Contact(email)")
+        assert err is None
+        assert prop.api_type == "email"
+
+    def test_phone(self):
+        prop, err = parse_property_def("Phone(phone)")
+        assert err is None
+        assert prop.api_type == "phone_number"
+
+    def test_created_time(self):
+        prop, err = parse_property_def("Created(created)")
+        assert err is None
+        assert prop.api_type == "created_time"
+
+    def test_created_by(self):
+        prop, err = parse_property_def("Author(created_by)")
+        assert err is None
+        assert prop.api_type == "created_by"
+
+    def test_edited_time(self):
+        prop, err = parse_property_def("Modified(edited)")
+        assert err is None
+        assert prop.api_type == "last_edited_time"
+
+    def test_edited_by(self):
+        prop, err = parse_property_def("Editor(edited_by)")
+        assert err is None
+        assert prop.api_type == "last_edited_by"
+
+    # --- Types with config ---
+
+    def test_select_with_options(self):
+        prop, err = parse_property_def("Status(select: Todo, Doing, Done)")
+        assert err is None
+        assert prop.dnn_type == "select"
+        assert prop.options == ["Todo", "Doing", "Done"]
+
+    def test_select_without_options(self):
+        """Select with no options is valid — Notion auto-creates."""
+        prop, err = parse_property_def("Status(select)")
+        assert err is None
+        assert prop.options == []
+
+    def test_multi_select_with_options(self):
+        prop, err = parse_property_def("Tags(multi_select: Bug, Feature)")
+        assert err is None
+        assert prop.options == ["Bug", "Feature"]
+
+    def test_number_with_format(self):
+        prop, err = parse_property_def("Revenue(number: dollar)")
+        assert err is None
+        assert prop.number_format == "dollar"
+
+    def test_number_without_format(self):
+        prop, err = parse_property_def("Count(number)")
+        assert err is None
+        assert prop.number_format == ""
+
+    def test_number_percent(self):
+        prop, err = parse_property_def("Rate(number: percent)")
+        assert err is None
+        assert prop.number_format == "percent"
+
+    def test_id_with_prefix(self):
+        prop, err = parse_property_def("TaskID(id: TASK)")
+        assert err is None
+        assert prop.id_prefix == "TASK"
+
+    def test_id_without_prefix(self):
+        prop, err = parse_property_def("ID(id)")
+        assert err is None
+        assert prop.id_prefix == ""
+
+    # --- Quoted names ---
+
+    def test_quoted_name(self):
+        prop, err = parse_property_def('"Due Date"(date)')
+        assert err is None
+        assert prop.name == "Due Date"
+        assert prop.api_type == "date"
+
+    def test_quoted_name_with_config(self):
+        prop, err = parse_property_def('"Task Status"(select: Open, Closed)')
+        assert err is None
+        assert prop.name == "Task Status"
+        assert prop.options == ["Open", "Closed"]
+
+    # --- Relation properties ---
+
+    def test_relation_single(self):
+        prop, err = parse_property_def("Projects(relation: Y3z4)")
+        assert err is None
+        assert prop.relation_db == "Y3z4"
+        assert prop.relation_dual == ""
+
+    def test_relation_dual(self):
+        prop, err = parse_property_def('Tasks(relation: Y3z4, dual: "Related Projects")')
+        assert err is None
+        assert prop.relation_db == "Y3z4"
+        assert prop.relation_dual == "Related Projects"
+
+    def test_relation_dual_unquoted(self):
+        prop, err = parse_property_def("Tasks(relation: Y3z4, dual: Backlinks)")
+        assert err is None
+        assert prop.relation_db == "Y3z4"
+        assert prop.relation_dual == "Backlinks"
+
+    def test_relation_no_db_id(self):
+        """Relation without target DB is an error."""
+        _, err = parse_property_def("Projects(relation)")
+        assert err is not None
+        assert "target database" in err.lower()
+
+    # --- Error cases ---
+
+    def test_empty_input(self):
+        _, err = parse_property_def("")
+        assert err is not None
+
+    def test_no_type(self):
+        _, err = parse_property_def("Name")
+        assert err is not None
+        assert "Missing type" in err
+
+    def test_empty_type(self):
+        _, err = parse_property_def("Name()")
+        assert err is not None
+
+    def test_unsupported_type(self):
+        _, err = parse_property_def("Name(formula)")
+        assert err is not None
+        assert "Unsupported" in err
+
+    def test_bad_number_format(self):
+        _, err = parse_property_def("N(number: bananas)")
+        assert err is not None
+        assert "number format" in err.lower()
+
+    def test_config_on_configless_type(self):
+        _, err = parse_property_def("Name(date: extra)")
+        assert err is not None
+
+    def test_unclosed_quote(self):
+        _, err = parse_property_def('"Unclosed(title)')
+        assert err is not None
+        assert "Unclosed" in err
+
+    def test_empty_name(self):
+        _, err = parse_property_def("(title)")
+        assert err is not None
+        assert "Empty property name" in err
+
+    def test_whitespace_handling(self):
+        """Leading/trailing whitespace should be stripped."""
+        prop, err = parse_property_def("  Name(title)  ")
+        assert err is None
+        assert prop.name == "Name"
+
+
+class TestPropertyDefToNotion:
+    """Tests for property_def_to_notion — converting parsed defs to API format."""
+
+    def test_title_schema(self):
+        prop, _ = parse_property_def("Name(title)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"title": {}}
+
+    def test_rich_text_schema(self):
+        prop, _ = parse_property_def("Desc(text)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"rich_text": {}}
+
+    def test_select_with_options_schema(self):
+        prop, _ = parse_property_def("S(select: A, B, C)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"select": {"options": [
+            {"name": "A"}, {"name": "B"}, {"name": "C"}
+        ]}}
+
+    def test_select_without_options_schema(self):
+        prop, _ = parse_property_def("S(select)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"select": {}}
+
+    def test_multi_select_schema(self):
+        prop, _ = parse_property_def("T(multi_select: X, Y)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"multi_select": {"options": [
+            {"name": "X"}, {"name": "Y"}
+        ]}}
+
+    def test_number_with_format_schema(self):
+        prop, _ = parse_property_def("R(number: dollar)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"number": {"format": "dollar"}}
+
+    def test_number_without_format_schema(self):
+        prop, _ = parse_property_def("N(number)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"number": {}}
+
+    def test_unique_id_with_prefix_schema(self):
+        prop, _ = parse_property_def("ID(id: TASK)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"unique_id": {"prefix": "TASK"}}
+
+    def test_unique_id_without_prefix_schema(self):
+        prop, _ = parse_property_def("ID(id)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"unique_id": {}}
+
+    def test_date_schema(self):
+        prop, _ = parse_property_def("D(date)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"date": {}}
+
+    def test_checkbox_schema(self):
+        prop, _ = parse_property_def("C(checkbox)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"checkbox": {}}
+
+    def test_url_schema(self):
+        prop, _ = parse_property_def("U(url)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"url": {}}
+
+    def test_email_schema(self):
+        prop, _ = parse_property_def("E(email)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"email": {}}
+
+    def test_phone_schema(self):
+        prop, _ = parse_property_def("P(phone)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"phone_number": {}}
+
+    def test_created_time_schema(self):
+        prop, _ = parse_property_def("C(created)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"created_time": {}}
+
+    def test_created_by_schema(self):
+        prop, _ = parse_property_def("C(created_by)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"created_by": {}}
+
+    def test_edited_time_schema(self):
+        prop, _ = parse_property_def("E(edited)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"last_edited_time": {}}
+
+    def test_edited_by_schema(self):
+        prop, _ = parse_property_def("E(edited_by)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"last_edited_by": {}}
+
+    def test_relation_single_schema(self):
+        prop, _ = parse_property_def("P(relation: Y3z4)")
+        notion = property_def_to_notion(prop)
+        assert notion == {"relation": {
+            "database_id": "Y3z4",
+            "type": "single_property",
+            "single_property": {},
+        }}
+
+    def test_relation_dual_schema(self):
+        prop, _ = parse_property_def('P(relation: Y3z4, dual: "Back Ref")')
+        notion = property_def_to_notion(prop)
+        assert notion == {"relation": {
+            "database_id": "Y3z4",
+            "type": "dual_property",
+            "dual_property": {"synced_property_name": "Back Ref"},
+        }}
+
+    def test_all_creatable_types_have_api_mapping(self):
+        """Every creatable type must be in DNN_TO_API_TYPE."""
+        for dnn_type in CREATABLE_PROPERTY_TYPES:
+            assert dnn_type in DNN_TO_API_TYPE, f"{dnn_type} missing from DNN_TO_API_TYPE"
+
+
+# =============================================================================
+# +db Parser Tests
+# =============================================================================
+
+
+class TestParseAddDb:
+    """Tests for +db command parsing."""
+
+    def test_basic_db_creation(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+db parent=PaId title="Tasks"\n  Name(title)\n  Status(select: Todo, Done)'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+        op = result.operations[0]
+        assert op.command == ApplyCommand.ADD_DB
+        assert op.parent == "PaId"
+        assert op.title == "Tasks"
+        assert len(op.property_defs) == 2
+        assert op.property_defs[0].name == "Name"
+        assert op.property_defs[0].dnn_type == "title"
+        assert op.property_defs[1].name == "Status"
+        assert op.property_defs[1].options == ["Todo", "Done"]
+
+    def test_db_with_icon(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+db parent=PaId title="Tasks" icon=📊\n  Name(title)'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.icon == "📊"
+
+    def test_db_with_many_types(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = (
+            '+db parent=PaId title="Project"\n'
+            '  Name(title)\n'
+            '  Description(text)\n'
+            '  Due(date)\n'
+            '  Done(checkbox)\n'
+            '  Website(url)\n'
+            '  Revenue(number: dollar)\n'
+            '  Tags(multi_select: Bug, Feature)\n'
+            '  TaskID(id: PROJ)'
+        )
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert len(result.operations[0].property_defs) == 8
+
+    def test_db_missing_title_property(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+db parent=PaId title="Tasks"\n  Status(select: Todo, Done)'
+        result = parse_apply_script(script, registry)
+        assert any(e.code == "MISSING_TITLE_PROPERTY" for e in result.errors)
+
+    def test_db_bad_property_def(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+db parent=PaId title="Tasks"\n  Name(title)\n  Bad(formula)'
+        result = parse_apply_script(script, registry)
+        assert any(e.code == "BAD_PROPERTY_DEF" for e in result.errors)
+
+    def test_db_with_tab_indented_props(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+db parent=PaId title="Tasks"\n\tName(title)\n\tDue(date)'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert len(result.operations[0].property_defs) == 2
+
+    def test_db_followed_by_other_command(self):
+        """Commands after +db block should parse separately."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "DbId")
+        script = (
+            '+db parent=PaId title="Tasks"\n'
+            '  Name(title)\n'
+            '+row db=DbId\n'
+            '  Name=Test'
+        )
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert len(result.operations) == 2
+        assert result.operations[0].command == ApplyCommand.ADD_DB
+        assert result.operations[1].command == ApplyCommand.ADD_ROW
+
+    def test_db_with_relation(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "TgDb")
+        script = (
+            '+db parent=PaId title="Tasks"\n'
+            '  Name(title)\n'
+            '  Projects(relation: TgDb)'
+        )
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.property_defs[1].relation_db == "TgDb"
+
+    def test_db_with_dual_relation(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "TgDb")
+        script = (
+            '+db parent=PaId title="Tasks"\n'
+            '  Name(title)\n'
+            '  Projects(relation: TgDb, dual: "Related Tasks")'
+        )
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert result.operations[0].property_defs[1].relation_dual == "Related Tasks"
+
+
+# =============================================================================
+# +prop, xprop, uprop Parser Tests
+# =============================================================================
+
+
+class TestParseAddProp:
+    """Tests for +prop command parsing."""
+
+    def test_add_simple_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = "+prop db=DbId Priority(number)"
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+        op = result.operations[0]
+        assert op.command == ApplyCommand.ADD_PROP
+        assert op.database == "DbId"
+        assert op.property_def.name == "Priority"
+        assert op.property_def.api_type == "number"
+
+    def test_add_select_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = "+prop db=DbId Tags(multi_select: Bug, Feature)"
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.property_def.options == ["Bug", "Feature"]
+
+    def test_add_prop_bad_def(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = "+prop db=DbId BadProp(formula)"
+        result = parse_apply_script(script, registry)
+        assert any(e.code == "BAD_PROPERTY_DEF" for e in result.errors)
+
+    def test_add_relation_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "TgDb")
+        script = "+prop db=DbId Projects(relation: TgDb)"
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert result.operations[0].property_def.relation_db == "TgDb"
+
+
+class TestParseDeleteProp:
+    """Tests for xprop command parsing."""
+
+    def test_delete_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = "xprop db=DbId Priority"
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.command == ApplyCommand.DELETE_PROP
+        assert op.database == "DbId"
+        assert op.target == "Priority"
+
+    def test_delete_quoted_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = 'xprop db=DbId "Due Date"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        assert result.operations[0].target == "Due Date"
+
+
+class TestParseRenameProp:
+    """Tests for uprop command parsing."""
+
+    def test_rename_prop(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = 'uprop db=DbId Priority -> "Urgency"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.command == ApplyCommand.RENAME_PROP
+        assert op.database == "DbId"
+        assert op.old_name == "Priority"
+        assert op.new_name == "Urgency"
+
+    def test_rename_quoted_names(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = 'uprop db=DbId "Old Name" -> "New Name"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.old_name == "Old Name"
+        assert op.new_name == "New Name"
+
+    def test_rename_unquoted(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "DbId")
+        script = "uprop db=DbId OldName -> NewName"
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.old_name == "OldName"
+        assert op.new_name == "NewName"
+
+
+# =============================================================================
+# +page Positional Insertion Tests
+# =============================================================================
+
+
+class TestParsePagePosition:
+    """Tests for +page after= and pos=start parsing."""
+
+    def test_page_with_after(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "BlId")
+        script = '+page parent=PaId after=BlId title="New Page"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.command == ApplyCommand.ADD_PAGE
+        assert op.parent == "PaId"
+        assert op.after == "BlId"
+        assert op.title == "New Page"
+        assert op.position is None
+
+    def test_page_with_pos_start(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId pos=start title="New Page"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.position == "start"
+        assert op.after is None
+
+    def test_page_default_no_position(self):
+        """Default +page has no after or position."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId title="New Page"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.after is None
+        assert op.position is None
+
+    def test_page_with_after_and_icon(self):
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "BlId")
+        script = '+page parent=PaId after=BlId title="New" icon=📝'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.after == "BlId"
+        assert op.icon == "📝"
+        assert op.title == "New"
+
+    def test_page_with_pos_start_and_content(self):
+        """pos=start + content blocks should both work."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId pos=start title="New"\n  Hello world'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.position == "start"
+        assert len(op.content_blocks) == 1
+
+    def test_existing_page_commands_still_work(self):
+        """Verify existing +page syntax with icon and cover still works."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId title="Test" icon=📄 cover=https://example.com/img.png'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.title == "Test"
+        assert op.icon == "📄"
+        assert op.cover == "https://example.com/img.png"

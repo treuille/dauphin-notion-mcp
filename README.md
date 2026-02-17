@@ -90,6 +90,15 @@ Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply
 
 ## Changelog
 
+### 2026-02-17
+
+- **Full table support** — tables are no longer opaque placeholders. They render as pipe-delimited rows (`| cell | cell |`) with full read/write roundtrip. Consecutive table rows auto-group into a table parent, and Markdown separator rows are silently dropped.
+- **Structural block notation** — column layouts and tables use a new `!type N` notation (`!cols 3`, `!col 1`, `!table 4`) that exposes their structure for editing, replacing the old opaque rendering of columns.
+- **Database management commands** — `+db` creates databases with typed property definitions, `+prop` adds properties, `xprop` deletes properties, and `uprop` renames properties. Property definitions use a compact `Name(type: config)` syntax supporting select options, number formats, relation targets, and dual relations.
+- **Page positioning** — `+page` now accepts `after=<block_id>` and `pos=start` to control where new pages appear within their parent.
+- **Variable-length code fences** — code blocks now support 3+ backticks, with the closing fence required to match the opening length.
+- **Improved `!`-prefix disambiguation** — callout, opaque, and structural blocks all start with `!` and are now disambiguated in a clear priority order: colored callouts → opaque (`!type~`) → structural (`!type N`) → default callout.
+
 ### 2026-02-14
 
 Major new features:
