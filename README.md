@@ -33,7 +33,7 @@ One big departure from markdown is those four-character codes on the left (`R4kQ
 
 ## Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (or another MCP client)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://developers.openai.com/codex/) (untested) or another MCP client
 - A [Notion](https://www.notion.so/) account with an API integration
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
 
@@ -78,6 +78,29 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
 ```
 
 Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply`, `notion_search`, `notion_check_auth`, and `notion_get_url`. Ask Claude to run `notion_check_auth` to verify the connection.
+
+### 3b. Add to Codex (untested)
+
+> **Note:** These instructions have not been tested. If you run into issues, please [open an issue](https://github.com/treuille/dauphin-notion-mcp/issues).
+
+Add this to `~/.codex/config.toml` (or a project-scoped `.codex/config.toml`):
+
+```toml
+[mcp_servers.dauphin-notion-mcp]
+command = "uvx"
+args = [
+  "--refresh",
+  "--from", "git+https://github.com/treuille/dauphin-notion-mcp",
+  "dauphin-notion-mcp",
+  "--token-file", "~/.config/dauphin-notion-mcp/token",
+]
+```
+
+Or use the CLI:
+
+```bash
+codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/treuille/dauphin-notion-mcp dauphin-notion-mcp --token-file ~/.config/dauphin-notion-mcp/token
+```
 
 ## Not yet supported
 
