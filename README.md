@@ -65,6 +65,7 @@ Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
       "type": "stdio",
       "command": "uvx",
       "args": [
+        "--refresh",
         "--from",
         "git+https://github.com/treuille/dauphin-notion-mcp",
         "dauphin-notion-mcp",
