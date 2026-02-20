@@ -13,7 +13,7 @@ import random
 import re
 import string
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -3524,6 +3524,52 @@ RENAME_PROP_PATTERN = re.compile(
 )
 
 
+def _check_missing_payload(
+    lines: list[str],
+    i: int,
+    cmd_name: str,
+    line_num: int,
+    payload_re: str,
+    format_hint: str,
+) -> Optional[DnnParseError]:
+    """Check for missing or non-indented payload after a command.
+
+    Called when a command like +row/urow/+db did NOT find an indented
+    payload line. Inspects the next line to produce a helpful diagnostic.
+
+    Returns:
+        DnnParseError if payload is missing/non-indented, None otherwise.
+    """
+    if i >= len(lines) or not lines[i].strip():
+        # EOF or blank line — payload missing entirely
+        return DnnParseError(
+            code="PARSE_ERROR",
+            message=f"{cmd_name} requires an indented payload line",
+            line=line_num,
+            excerpt=f"{line_num}|{lines[line_num].rstrip()[:60]}" if line_num < len(lines) else "",
+            suggestions=[f"Add an indented line below: e.g.   {format_hint}"],
+        )
+    next_line = lines[i]
+    if re.match(payload_re, next_line.strip()):
+        # Next line looks like payload but isn't indented
+        return DnnParseError(
+            code="PARSE_ERROR",
+            message=f"line {i} looks like payload for {cmd_name} — indent by 2 spaces",
+            line=i,
+            excerpt=f"{i}|{next_line.rstrip()[:60]}",
+            suggestions=[f"Change to:   {next_line.strip()[:40]}"],
+            autofix={"safe": True, "patched": f"  {next_line.strip()}"},
+        )
+    # Next line is a different command — payload missing
+    return DnnParseError(
+        code="PARSE_ERROR",
+        message=f"{cmd_name} requires an indented payload line",
+        line=line_num,
+        excerpt=f"{line_num}|{lines[line_num].rstrip()[:60]}" if line_num < len(lines) else "",
+        suggestions=[f"Add an indented line below: e.g.   {format_hint}"],
+    )
+
+
 def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
     """Parse an apply script into operations.
 
@@ -3810,7 +3856,21 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             if i < len(lines) and lines[i] and lines[i][0] in ' \t':
                 op.row_values = _parse_row_values(lines[i].strip())
+                if not op.row_values:
+                    errors.append(DnnParseError(
+                        code="PARSE_ERROR",
+                        message="+row payload has no valid key=value pairs",
+                        line=i,
+                        excerpt=f"{i}|{lines[i].rstrip()[:60]}",
+                        suggestions=["Format: Name=value\\tStatus=Done"],
+                    ))
                 i += 1
+            else:
+                err = _check_missing_payload(
+                    lines, i, "+row", line_num,
+                    r'\w+=', "Name=value\\tStatus=Done")
+                if err:
+                    errors.append(err)
             operations.append(op)
             continue
 
@@ -3826,7 +3886,21 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             if i < len(lines) and lines[i] and lines[i][0] in ' \t':
                 op.row_values = _parse_row_values(lines[i].strip())
+                if not op.row_values:
+                    errors.append(DnnParseError(
+                        code="PARSE_ERROR",
+                        message="urow payload has no valid key=value pairs",
+                        line=i,
+                        excerpt=f"{i}|{lines[i].rstrip()[:60]}",
+                        suggestions=["Format: Status=Done\\tPriority=High"],
+                    ))
                 i += 1
+            else:
+                err = _check_missing_payload(
+                    lines, i, "urow", line_num,
+                    r'\w+=', "Status=Done\\tPriority=High")
+                if err:
+                    errors.append(err)
             operations.append(op)
             continue
 
@@ -3877,13 +3951,30 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                         has_title_prop = True
                 i += 1
             if not has_title_prop and not errors:
-                errors.append(DnnParseError(
-                    code="MISSING_TITLE_PROPERTY",
-                    message="+db requires at least one title property",
-                    line=line_num,
-                    excerpt=f"{line_num}|{line[:60]}",
-                    suggestions=["Add a line like: Name(title)"]
-                ))
+                # Check if the next non-indented line looks like a
+                # property def (agent forgot to indent)
+                if not op.property_defs:
+                    payload_err = _check_missing_payload(
+                        lines, i, "+db", line_num,
+                        r'\w+\(', "Name(title)")
+                    if payload_err and "looks like payload" in payload_err.message:
+                        errors.append(payload_err)
+                    else:
+                        errors.append(DnnParseError(
+                            code="MISSING_TITLE_PROPERTY",
+                            message="+db requires at least one title property",
+                            line=line_num,
+                            excerpt=f"{line_num}|{line[:60]}",
+                            suggestions=["Add a line like: Name(title)"]
+                        ))
+                else:
+                    errors.append(DnnParseError(
+                        code="MISSING_TITLE_PROPERTY",
+                        message="+db requires at least one title property",
+                        line=line_num,
+                        excerpt=f"{line_num}|{line[:60]}",
+                        suggestions=["Add a line like: Name(title)"]
+                    ))
             operations.append(op)
             continue
 
@@ -6278,44 +6369,50 @@ def _detect_conflicts(ops: list[ApplyOp]) -> list[str]:
     return errors
 
 
-def _identify_move_chains(ops: list[ApplyOp]) -> list[list[int]]:
-    """Identify consecutive moves to the same parent needing sequential execution.
+def _find_consecutive_chains(
+    ops: list[ApplyOp],
+    match_fn: Callable[[ApplyOp], bool],
+    group_key_fn: Callable[[ApplyOp], Optional[str]],
+) -> list[list[int]]:
+    """Find runs of consecutive ops that share a grouping key.
 
-    When multiple moves target the same parent without explicit after=,
-    parallel execution produces non-deterministic ordering. This function
-    finds runs of such moves so the executor can run them sequentially
-    and auto-chain each move after the previous one.
+    Used to identify operations that must run sequentially:
+    - Move chains: consecutive moves to the same parent (for ordering)
+    - Schema chains: consecutive schema ops on the same database
 
     Returns list of chains, each a list of op indices (length >= 2).
-    Single moves and non-move ops are not included.
     """
     chains: list[list[int]] = []
     current_chain: list[int] = []
-    current_parent: Optional[str] = None
+    current_key: Optional[str] = None
 
     for i, op in enumerate(ops):
-        is_chainable = (
-            op.command == ApplyCommand.MOVE
-            and op.dest_parent is not None
-            and op.dest_after is None
-        )
-
-        if is_chainable and op.dest_parent == current_parent:
-            current_chain.append(i)
+        if match_fn(op):
+            key = group_key_fn(op)
+            if key == current_key:
+                current_chain.append(i)
+            else:
+                if len(current_chain) >= 2:
+                    chains.append(current_chain)
+                current_chain = [i]
+                current_key = key
         else:
             if len(current_chain) >= 2:
                 chains.append(current_chain)
-            if is_chainable:
-                current_chain = [i]
-                current_parent = op.dest_parent
-            else:
-                current_chain = []
-                current_parent = None
+            current_chain = []
+            current_key = None
 
     if len(current_chain) >= 2:
         chains.append(current_chain)
 
     return chains
+
+
+_SCHEMA_COMMANDS = frozenset({
+    ApplyCommand.ADD_PROP,
+    ApplyCommand.DELETE_PROP,
+    ApplyCommand.RENAME_PROP,
+})
 
 
 async def execute_apply_script(
@@ -6395,13 +6492,28 @@ async def execute_apply_script(
                      for op in parse_result.operations]
         )
 
-    # Identify move chains: consecutive moves to the same parent without
-    # explicit after=. These must run sequentially to preserve script order.
+    # Identify chains: groups of consecutive ops that must run sequentially.
+    # - Move chains: consecutive moves to the same parent without after=
+    # - Schema chains: consecutive schema ops on the same database
     ops = parse_result.operations
-    chains = _identify_move_chains(ops)
-    chained_indices = {idx for chain in chains for idx in chain}
+    move_chains = _find_consecutive_chains(
+        ops,
+        match_fn=lambda op: (
+            op.command == ApplyCommand.MOVE
+            and op.dest_parent is not None
+            and op.dest_after is None
+        ),
+        group_key_fn=lambda op: op.dest_parent,
+    )
+    schema_chains = _find_consecutive_chains(
+        ops,
+        match_fn=lambda op: op.command in _SCHEMA_COMMANDS,
+        group_key_fn=lambda op: op.database,
+    )
+    all_chains = move_chains + schema_chains
+    chained_indices = {idx for chain in all_chains for idx in chain}
 
-    if not chains:
+    if not all_chains:
         # Fast path: no chains, execute everything in parallel
         op_results = await asyncio.gather(
             *[execute_apply_op(op, registry) for op in ops],
@@ -6411,29 +6523,32 @@ async def execute_apply_script(
         # Mixed execution: parallel for independent ops, sequential for chains
         op_results_arr: list[Any] = [None] * len(ops)
 
-        async def _run_move_chain(
+        async def _run_sequential_chain(
             chain_indices: list[int],
+            inject_after: bool = False,
         ) -> list[tuple[int, Any]]:
-            """Execute a move chain sequentially, auto-chaining after=."""
+            """Execute chained ops sequentially.
+
+            When inject_after=True (move chains), auto-chain each move
+            after the previous one's new block ID.
+            """
             results: list[tuple[int, Any]] = []
             prev_new_short: Optional[str] = None
             for idx in chain_indices:
                 op = ops[idx]
-                # Inject after= from previous move's new block ID
-                if prev_new_short is not None:
+                # Move chain: inject after= from previous move's new block ID
+                if inject_after and prev_new_short is not None:
                     op.dest_after = prev_new_short
                 try:
                     res = await execute_apply_op(op, registry)
                     results.append((idx, res))
-                    op_result, error = res
-                    if not error and isinstance(op_result.get("moved"), dict):
-                        for _, new_id in op_result["moved"].items():
-                            prev_new_short = new_id
-                    # On error, keep prev_new_short — next move chains
-                    # after the last successfully moved block
+                    if inject_after:
+                        op_result, error = res
+                        if not error and isinstance(op_result.get("moved"), dict):
+                            for _, new_id in op_result["moved"].items():
+                                prev_new_short = new_id
                 except Exception as e:
                     results.append((idx, e))
-                    # Keep prev_new_short as-is
             return results
 
         # Build coroutines: one per independent op, one per chain
@@ -6444,7 +6559,13 @@ async def execute_apply_script(
                 parallel_coros.append(execute_apply_op(op, registry))
                 parallel_indices.append(i)
 
-        chain_coros = [_run_move_chain(chain) for chain in chains]
+        chain_coros = [
+            _run_sequential_chain(chain, inject_after=True)
+            for chain in move_chains
+        ] + [
+            _run_sequential_chain(chain, inject_after=False)
+            for chain in schema_chains
+        ]
 
         # Run everything in parallel (chains are internally sequential)
         all_results = await asyncio.gather(
@@ -6457,7 +6578,7 @@ async def execute_apply_script(
             op_results_arr[idx] = all_results[i]
 
         # Map chain results back to their original indices
-        for i, chain in enumerate(chains):
+        for i, chain in enumerate(all_chains):
             chain_result = all_results[len(parallel_coros) + i]
             if isinstance(chain_result, Exception):
                 for idx in chain:
@@ -6734,10 +6855,15 @@ async def notion_read(
 ) -> str:
     """Read Notion pages or databases in compact DNN format.
 
+    Pages return DNN block content (headings, lists, toggles, etc.).
+    Databases return CSV rows with @cols schema header.
+
     Args:
         pages: List of pages/databases to read. Each entry has:
-            - ref (required): short ID, full UUID, or Notion URL
-            - mode (optional): "edit" (default) or "view"
+            - ref (required): short ID, full UUID, Notion URL,
+              or typed ref (p:ID, b:ID, r:ID)
+            - mode (optional): "edit" (default, includes 4-char IDs
+              for mutations) or "view" (no IDs, max compression)
             - depth (optional): page nesting depth for this ref
             - limit (optional): DB row limit for this ref
             - filter (optional): DB filter DSL for this ref
@@ -6752,6 +6878,11 @@ async def notion_read(
             Operators: = != ~ !~ < > <= >= ? !?
             Logic: & (and), | (or), () grouping.
             Quote names with spaces: "Last Contact" >= 2024-01-01
+            Relative dates: -Nd (e.g. -14d = 14 days ago, -7d = 1 week ago)
+            Examples:
+                Status = Done & Due < 2024-01-15
+                "Last Contact" >= -14d & Language = French
+                (Status = Done | Status = "In Progress") & Due < -7d
         sort: Database sort (default for all refs).
             E.g. 'Due desc, Status asc'. Default direction: ascending.
         columns: Database columns (default for all refs).
@@ -6759,6 +6890,26 @@ async def notion_read(
 
     Returns:
         DNN formatted content. Multiple pages separated by ▤ headers.
+
+        Page output (blocks with IDs in edit mode):
+            @dnn 1
+            @page 9a8b7c6d
+            @title My Page
+            A1b2 # Heading
+            C3d4 [ ] Task item
+
+        Database output (CSV rows with schema):
+            @dnn 1
+            @db 8x7y6z5w
+            @ds 7w6v5u4t
+            @title Tasks
+            @cols (icon),Name(title),Status(select),Due(date)
+            🐛,I9j0,Fix bug,In Progress,2024-01-12
+            ✅,K1l2,Ship it,Done,2024-01-13
+
+        Row properties and page body require two separate reads
+        (Notion data model: properties on page object, body in blocks).
+
         Returns error if filter/sort/columns used on a non-database ref.
     """
     # Parse page specs — per-ref params override top-level defaults
@@ -7001,7 +7152,7 @@ async def notion_apply(
         operations: Alias for script. Use one or the other, not both.
         action: Alias for script. Use one or the other, not both.
         dry_run: If True, validate script without executing (default False).
-        allow_partial: If True, continue on errors (default False).
+        allow_partial: Deprecated, ignored. All ops always run.
 
     Block Commands:
         + parent=ID [after=ID]    Add blocks (indented content follows)
@@ -7029,8 +7180,18 @@ async def notion_apply(
         ! Callout      !gray Gray callout   !red Warning callout
         ---            (divider)
         ```python      (code block, close with ```)
+        !table N       (explicit table with N columns, child rows follow)
+        | c | c | c |  (table row — consecutive rows auto-group into table)
 
     Callout colors: gray, brown, orange, yellow, green, blue, purple, pink, red
+
+    Table Operations (use standard block commands on existing tables):
+        + parent=TABLE_ID                     Add row to table
+          | New Cell | Data | Here |
+        + parent=TABLE_ID after=ROW_ID        Add row after specific row
+          | Inserted | After | Row |
+        u ROW_ID = "| Updated | Cell | Data |"   Update row content
+        x ROW_ID                              Delete row
 
     Inline Formatting (in any text content):
         **bold**  *italic*  ~~strike~~  `code`  :u[underline]
@@ -7139,6 +7300,22 @@ async def notion_apply(
         m Source1 -> parent=Target after=Anchor
         u Text1 = "Updated with **bold** and :green[color]"
         t Todo1 = 1
+
+    Example - Table (auto-grouped from consecutive pipe rows):
+        + parent=A1b2
+          | Name | Status | Notes |
+          | Task one | Done | Shipped |
+          | Task two | In progress | On track |
+
+        Consecutive pipe rows auto-group into a Notion table.
+        Separator rows (|---|---|) are silently dropped.
+        Cells support rich text: **bold**, [links](url), etc.
+
+    Example - Explicit table with !table marker:
+        + parent=A1b2
+          !table 3
+          | Name | Status | Notes |
+          | Task one | Done | Shipped |
 
     Example - Database row with date range:
         +row db=TasksDB
@@ -7274,7 +7451,6 @@ def main():
         datefmt="%H:%M:%S"
     )
 
-    # Load token from file
     global _notion_token
     token_path = Path(args.token_file).expanduser()
     if not token_path.exists():

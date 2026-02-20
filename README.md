@@ -114,6 +114,12 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
+### 2026-02-20
+
+- **Missing payload diagnostics** — `+row`, `urow`, and `+db` now detect missing or non-indented payloads and produce actionable error messages with autofix suggestions, instead of silently accepting incomplete commands.
+- **Sequential schema execution** — consecutive schema operations (`+prop`, `xprop`, `uprop`) on the same database now execute sequentially to avoid race conditions, using the same chaining mechanism as consecutive moves.
+- **Expanded tool docstrings** — `notion.read` and `notion.apply` docstrings updated with table operations, relative date filter examples, typed refs, and clearer parameter descriptions.
+
 ### 2026-02-17
 
 - **Database creation and management** — `+db` creates databases with typed property definitions, `+prop` adds properties, `xprop` deletes properties, and `uprop` renames properties. Property definitions use a compact `Name(type: config)` syntax supporting select options, number formats, relation targets, and dual relations.

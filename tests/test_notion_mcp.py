@@ -30,7 +30,8 @@ from notion_mcp import (
     _check_movability,
     _coerce_value,
     _detect_conflicts,
-    _identify_move_chains,
+    _find_consecutive_chains,
+    _SCHEMA_COMMANDS,
     _fetch_database_schema,
     _find_property,
     _notion_request,
@@ -3075,8 +3076,21 @@ class TestDnnMentionRoundTrip:
         assert dnn == "today"
 
 
+def _identify_move_chains(ops):
+    """Thin wrapper for backward compat with existing tests."""
+    return _find_consecutive_chains(
+        ops,
+        match_fn=lambda op: (
+            op.command == ApplyCommand.MOVE
+            and op.dest_parent is not None
+            and op.dest_after is None
+        ),
+        group_key_fn=lambda op: op.dest_parent,
+    )
+
+
 class TestIdentifyMoveChains:
-    """Tests for _identify_move_chains — detecting consecutive same-parent moves."""
+    """Tests for move chain detection via _find_consecutive_chains."""
 
     def _move_op(self, source, dest_parent, dest_after=None, line_num=0):
         return ApplyOp(
@@ -3175,6 +3189,152 @@ class TestIdentifyMoveChains:
             self._add_op("Z"),
         ]
         assert _identify_move_chains(ops) == [[1, 2, 3]]
+
+
+class TestSchemaChains:
+    """Tests for schema chain detection via _find_consecutive_chains."""
+
+    def _schema_chains(self, ops):
+        return _find_consecutive_chains(
+            ops,
+            match_fn=lambda op: op.command in _SCHEMA_COMMANDS,
+            group_key_fn=lambda op: op.database,
+        )
+
+    def _prop_op(self, db, cmd=ApplyCommand.ADD_PROP, line_num=0):
+        return ApplyOp(command=cmd, line_num=line_num, database=db)
+
+    def _add_op(self, parent, line_num=0):
+        return ApplyOp(command=ApplyCommand.ADD, line_num=line_num, parent=parent)
+
+    def test_empty(self):
+        assert self._schema_chains([]) == []
+
+    def test_single_schema_op(self):
+        ops = [self._prop_op("X")]
+        assert self._schema_chains(ops) == []
+
+    def test_two_schema_ops_same_db(self):
+        ops = [
+            self._prop_op("X", ApplyCommand.ADD_PROP),
+            self._prop_op("X", ApplyCommand.DELETE_PROP),
+        ]
+        assert self._schema_chains(ops) == [[0, 1]]
+
+    def test_three_mixed_schema_ops_same_db(self):
+        ops = [
+            self._prop_op("X", ApplyCommand.ADD_PROP),
+            self._prop_op("X", ApplyCommand.DELETE_PROP),
+            self._prop_op("X", ApplyCommand.RENAME_PROP),
+        ]
+        assert self._schema_chains(ops) == [[0, 1, 2]]
+
+    def test_two_schema_ops_different_dbs(self):
+        ops = [
+            self._prop_op("X", ApplyCommand.ADD_PROP),
+            self._prop_op("Y", ApplyCommand.ADD_PROP),
+        ]
+        assert self._schema_chains(ops) == []
+
+    def test_non_schema_breaks_chain(self):
+        ops = [
+            self._prop_op("X", ApplyCommand.ADD_PROP),
+            self._add_op("Z"),
+            self._prop_op("X", ApplyCommand.DELETE_PROP),
+        ]
+        assert self._schema_chains(ops) == []
+
+    def test_two_separate_schema_chains(self):
+        ops = [
+            self._prop_op("X", ApplyCommand.ADD_PROP),
+            self._prop_op("X", ApplyCommand.DELETE_PROP),
+            self._prop_op("Y", ApplyCommand.ADD_PROP),
+            self._prop_op("Y", ApplyCommand.RENAME_PROP),
+        ]
+        assert self._schema_chains(ops) == [[0, 1], [2, 3]]
+
+
+class TestPayloadDiagnostics:
+    """Tests for _check_missing_payload — detecting non-indented payloads."""
+
+    def _parse(self, script):
+        registry = IdRegistry()
+        return parse_apply_script(script, registry)
+
+    def test_add_row_non_indented_payload(self):
+        result = self._parse("+row db=X\nName=Foo\tStatus=Done")
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        assert "indent" in err.message.lower() or "looks like payload" in err.message.lower()
+
+    def test_urow_non_indented_payload(self):
+        result = self._parse("urow R1ab\nStatus=Done")
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        assert "indent" in err.message.lower() or "looks like payload" in err.message.lower()
+
+    def test_add_db_non_indented_property(self):
+        result = self._parse('+db parent=X1y2 title="Tasks"\nName(title)')
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        assert "indent" in err.message.lower() or "looks like payload" in err.message.lower()
+
+    def test_add_row_eof(self):
+        result = self._parse("+row db=X")
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        assert "requires" in err.message.lower()
+
+    def test_add_row_followed_by_command(self):
+        """First +row has no payload, second has proper payload."""
+        result = self._parse("+row db=X\n+row db=Y\n  Name=Bar")
+        assert result.errors
+        # First +row should get the error
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        # Second +row should parse fine (has indented payload)
+        assert len(result.operations) == 2
+        assert result.operations[1].row_values == {"Name": "Bar"}
+
+    def test_add_db_followed_by_command(self):
+        """+db with no props, next line is a command → MISSING_TITLE_PROPERTY."""
+        result = self._parse('+db parent=X1y2 title="T"\n+row db=Z\n  T=F')
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "MISSING_TITLE_PROPERTY"
+
+    def test_add_row_empty_payload(self):
+        """Indented payload with no valid key=value pairs."""
+        result = self._parse("+row db=X\n  no-equals-sign")
+        assert result.errors
+        err = result.errors[0]
+        assert err.code == "PARSE_ERROR"
+        assert "key=value" in err.message.lower()
+
+    def test_add_row_indented_still_works(self):
+        """Regression: properly indented +row payload must still work."""
+        result = self._parse("+row db=X\n  Name=Foo\tStatus=Done")
+        assert not result.errors
+        assert len(result.operations) == 1
+        assert result.operations[0].row_values == {"Name": "Foo", "Status": "Done"}
+
+    def test_urow_indented_still_works(self):
+        """Regression: properly indented urow payload must still work."""
+        result = self._parse("urow R1ab\n  Status=Done\tPriority=High")
+        assert not result.errors
+        assert len(result.operations) == 1
+        assert result.operations[0].row_values == {"Status": "Done", "Priority": "High"}
+
+    def test_add_db_indented_still_works(self):
+        """Regression: properly indented +db props must still work."""
+        result = self._parse('+db parent=X1y2 title="Tasks"\n  Name(title)\n  Status(select: A, B)')
+        assert not result.errors
+        assert len(result.operations) == 1
+        assert len(result.operations[0].property_defs) == 2
 
 
 # =============================================================================
