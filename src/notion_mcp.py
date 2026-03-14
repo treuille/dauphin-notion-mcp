@@ -241,6 +241,27 @@ class IdRegistry:
         self._uuid_to_short[normalized] = sid
         return sid
 
+    def reassign(self, short_id: str, new_uuid: str) -> str:
+        """Reassign an existing short ID to a new UUID.
+
+        Updates the bidirectional mapping so the same short ID now
+        points to a different UUID. Used by move (clone+archive)
+        to preserve ID stability.
+        """
+        normalized = normalize_uuid(new_uuid)
+        # Remove old mapping
+        old_uuid = self._short_to_uuid.get(short_id)
+        if old_uuid:
+            del self._uuid_to_short[old_uuid]
+        # Remove any existing mapping for new UUID
+        existing_short = self._uuid_to_short.get(normalized)
+        if existing_short:
+            del self._short_to_uuid[existing_short]
+        # Set new mapping
+        self._short_to_uuid[short_id] = normalized
+        self._uuid_to_short[normalized] = short_id
+        return short_id
+
     def get_uuid(self, short_id: str) -> Optional[str]:
         """Look up the UUID for a short ID."""
         return self._short_to_uuid.get(short_id)
@@ -787,7 +808,7 @@ def _merge_adjacent_spans(spans: list[RichTextSpan]) -> list[RichTextSpan]:
 
 
 # Characters that start special syntax (used for literal text boundaries)
-_SPECIAL_CHARS = set('\\*~`[$:@')
+_SPECIAL_CHARS = set('\\*~`[:@')
 
 
 def _parse_date_mention(date_str: str) -> RichTextSpan:
@@ -820,17 +841,17 @@ def _make_inline_parser():
         except Exception:
             return [RichTextSpan(text=text)]
 
-    # Escape sequences: \* \~ \` \[ \] \: \$ \\ etc.
-    escape_chars = '\\*~`[]$:@#-|!>'
+    # Escape sequences: \* \~ \` \[ \] \: \\ etc.
+    escape_chars = '\\*~`[]:@#-|!>'
     escaped = (P.string('\\') >> P.char_from(escape_chars)).map(
         lambda c: RichTextSpan(text=c)
     )
 
-    # Equation: $expr$
+    # Equation directive: :eq[expr]
     equation = (
-        P.string('$') >>
-        P.regex(r'[^$]+') <<
-        P.string('$')
+        P.string(':eq[') >>
+        P.regex(r'((?:[^\[\]]|\[(?:[^\[\]])*\])*)') <<
+        P.string(']')
     ).map(lambda expr: RichTextSpan(text='', span_type='equation', expression=expr))
 
     # User mention: @user:UUID
@@ -936,7 +957,7 @@ def _make_inline_parser():
     # Order matters: try formats first, then literal runs, then single special chars
     formatted_or_literal = (
         escaped |           # Escape sequences first
-        equation |          # $...$
+        equation |          # :eq[...]
         mention_user |      # @user:UUID
         mention_date |      # @date:YYYY-MM-DD
         mention_page |      # @p:shortID (page @mention)
@@ -1048,7 +1069,7 @@ def notion_rich_text_to_dnn(rich_text: list[dict]) -> str:
 
         if item_type == "equation":
             expr = item.get("equation", {}).get("expression", "")
-            parts.append(f"${expr}$")
+            parts.append(f":eq[{expr}]")
             continue
 
         if item_type == "mention":
@@ -4635,6 +4656,7 @@ class ApplyLineResult:
     error: Optional[str] = None
     pages_at_bottom: list[str] = field(default_factory=list)  # pages created at bottom (no positioning)
     warnings: list[str] = field(default_factory=list)  # non-fatal warnings (e.g., link_mention conversion)
+    db_meta: Optional[dict] = None  # {"id": "7QI8", "props": ["Name", "Status", ...]}
 
 
 @dataclass
@@ -5594,7 +5616,7 @@ async def execute_apply_op(
             return {"op": "t", "toggled": op.target}, None
 
         elif op.command == ApplyCommand.MOVE:
-            # Move is clone+archive - IDs change
+            # Move is clone+archive - short ID is preserved via reassign
             source_id = _remap_id(op.source, id_map)
             source_uuid, err = _resolve_or_error(registry, source_id, "source")
             if err:
@@ -5648,13 +5670,13 @@ async def execute_apply_op(
             # Archive the original
             await delete_block_async(source_uuid)
 
-            # Build ID mapping for result
+            # Build ID mapping for result — reuse source short ID
             move_result = {}
             if created:
                 new_id = created[0].get("id", "")
                 if new_id:
-                    new_short = registry.register(new_id)
-                    move_result[op.source] = new_short
+                    registry.reassign(source_id, new_id)
+                    move_result[op.source] = source_id
 
             result: dict = {"op": "m", "moved": move_result}
             all_warnings = move_warnings + clone_warnings
@@ -5734,7 +5756,7 @@ async def execute_apply_op(
             row_id = result.get("id", "")
             short_id = registry.register(row_id) if row_id else ""
 
-            return {"op": "+row", "database": op.database, "created": short_id}, None
+            return {"op": "+row", "database": op.database, "created": [short_id]}, None
 
         elif op.command == ApplyCommand.UPDATE_ROW:
             # Update a database row's properties
@@ -6089,7 +6111,11 @@ async def execute_apply_op(
             db_id = result.get("id", "")
             short_id = registry.register(db_id) if db_id else ""
 
-            return {"op": "+db", "created": short_id}, None
+            return {
+                "op": "+db",
+                "created": [short_id],
+                "db_props": [p.name for p in op.property_defs],
+            }, None
 
         elif op.command == ApplyCommand.ADD_PROP:
             # Add a property to an existing database
@@ -6323,7 +6349,7 @@ def _detect_conflicts(ops: list[ApplyOp]) -> list[str]:
         for target in targets:
             target_map.setdefault(target, []).append(op.line_num)
 
-        # Track move sources (these IDs will become invalid)
+        # Track move sources (block position changes during move)
         if op.command == ApplyCommand.MOVE and op.source:
             moved_ids[op.source] = op.line_num
         if op.command == ApplyCommand.MOVE_PAGE and op.source:
@@ -6358,7 +6384,7 @@ def _detect_conflicts(ops: list[ApplyOp]) -> list[str]:
             if after_id in moved_ids:
                 errors.append(
                     f"Line {op.line_num}: after={after_id} invalid - "
-                    f"block is moved on line {moved_ids[after_id]} (ID will change)"
+                    f"block is moved on line {moved_ids[after_id]} (position may change)"
                 )
             if after_id in deleted_ids:
                 errors.append(
@@ -6617,6 +6643,13 @@ async def execute_apply_script(
         else:
             # Extract created IDs and moved mapping
             created = op_result.get("created", [])
+            if isinstance(created, str):
+                created = [created]
+
+            # Extract database metadata (+db response)
+            db_meta = None
+            if "db_props" in op_result and created:
+                db_meta = {"id": created[0], "props": op_result["db_props"]}
             moved = None
             if "moved" in op_result and isinstance(op_result["moved"], dict):
                 for old_id, new_id in op_result["moved"].items():
@@ -6645,7 +6678,8 @@ async def execute_apply_script(
                 moved=moved,
                 replaced=replaced,
                 pages_at_bottom=pages_at_bottom,
-                warnings=warnings
+                warnings=warnings,
+                db_meta=db_meta
             ))
 
     return result
@@ -7197,7 +7231,7 @@ async def notion_apply(
         **bold**  *italic*  ~~strike~~  `code`  :u[underline]
         :red[colored]  :yellow-background[highlighted]
         [link text](https://url)
-        $x^2 + y^2$              (equation)
+        :eq[x^2 + y^2]           (equation)
         @user:uuid-here          (user mention)
         @date:2025-01-15         (date mention)
         @date:2025-01-14→2025-01-16  (date range)
@@ -7267,7 +7301,8 @@ async def notion_apply(
     Returns:
         Compact multiline string with per-line results (0-indexed):
             0: +A1b2 +B2c3    (created IDs)
-            2: X1y2→Y2z3      (moved: old→new)
+            1: +db=C3d4  props: Name, Status, Due  (+db result)
+            2: X1y2            (moved, ID preserved)
             3: A1b2→B2c3      (updated with type change: old→new)
             4: err MESSAGE    (error)
             7: ok             (success, no IDs)
@@ -7342,7 +7377,12 @@ async def notion_apply(
     lines = []
     for lr in result.results:
         if lr.ok:
-            if lr.created:
+            if lr.db_meta:
+                # +db=ID  props: Prop1, Prop2, ...
+                props = ", ".join(lr.db_meta["props"])
+                line_text = f"{lr.line}: +db={lr.db_meta['id']}  props: {props}"
+                lines.append(line_text)
+            elif lr.created:
                 # +ID1 +ID2 for created blocks
                 line_text = f"{lr.line}: +" + " +".join(lr.created)
                 if lr.pages_at_bottom:
@@ -7350,8 +7390,11 @@ async def notion_apply(
                     line_text += f" (at bottom: {', '.join(lr.pages_at_bottom)})"
                 lines.append(line_text)
             elif lr.moved:
-                # OLD→NEW for moves
-                line_text = f"{lr.line}: {lr.moved[0]}→{lr.moved[1]}"
+                # OLD→NEW for moves (suppress arrow when ID preserved)
+                if lr.moved[0] == lr.moved[1]:
+                    line_text = f"{lr.line}: {lr.moved[0]}"
+                else:
+                    line_text = f"{lr.line}: {lr.moved[0]}→{lr.moved[1]}"
                 lines.append(line_text)
             elif lr.replaced:
                 # OLD→NEW for update with type change
@@ -7434,14 +7477,14 @@ def main():
 
     parser = argparse.ArgumentParser(description="Notion MCP Server")
     parser.add_argument(
-        "--token-file",
-        required=True,
-        help="Path to file containing Notion API token"
-    )
-    parser.add_argument(
         "--http",
         action="store_true",
         help="Run as HTTP server on localhost:2052 instead of stdio"
+    )
+    parser.add_argument(
+        "--token-file",
+        required=True,
+        help="Path to file containing Notion API token"
     )
     args = parser.parse_args()
 

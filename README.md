@@ -114,6 +114,14 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
+### 2026-03-14
+
+- **Equation syntax** — inline equations now use `:eq[expr]` directive instead of `$expr$`. Dollar signs are treated as literal text, so `$50` no longer triggers equation parsing.
+- **Stable move IDs** — moving a block preserves its short ID instead of assigning a new one, so references to moved blocks remain valid.
+- **`+db` response metadata** — `+db` results now include the database short ID and property names (e.g., `+db=7QI8  props: Name, Status, Due`).
+- **`+row` response format** — `+row` results now return created IDs as a list, consistent with other creation commands.
+- **ID registry reassign** — new `reassign()` method on the ID registry supports re-pointing a short ID to a different UUID, used internally by move operations.
+
 ### 2026-02-20
 
 - **Missing payload diagnostics** — `+row`, `urow`, and `+db` now detect missing or non-indented payloads and produce actionable error messages with autofix suggestions, instead of silently accepting incomplete commands.

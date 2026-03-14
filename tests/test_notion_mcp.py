@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from notion_mcp import (
     ApplyCommand,
+    ApplyLineResult,
     ApplyOp,
     BASE62_ALPHABET,
     CALLOUT_COLORS,
@@ -279,6 +280,42 @@ class TestIdRegistry:
         assert len(registry) == 2
         registry.clear()
         assert len(registry) == 0
+
+    def test_reassign_basic(self):
+        registry = IdRegistry()
+        old_uuid = "12345678-1234-1234-1234-123456789abc"
+        new_uuid = "abcdef12-3456-7890-abcd-ef1234567890"
+        sid = registry.register(old_uuid, short_id="A1b2")
+        assert sid == "A1b2"
+        # Reassign to new UUID
+        result = registry.reassign("A1b2", new_uuid)
+        assert result == "A1b2"
+        # Short ID now points to new UUID
+        assert registry.get_uuid("A1b2") == normalize_uuid(new_uuid)
+        # Old UUID is no longer mapped
+        assert registry.get_short_id(old_uuid) is None
+        # New UUID maps to same short ID
+        assert registry.get_short_id(new_uuid) == "A1b2"
+
+    def test_reassign_overwrites_existing_new_uuid_mapping(self):
+        registry = IdRegistry()
+        uuid1 = "12345678-1234-1234-1234-123456789abc"
+        uuid2 = "abcdef12-3456-7890-abcd-ef1234567890"
+        sid1 = registry.register(uuid1, short_id="A1b2")
+        sid2 = registry.register(uuid2, short_id="C3d4")
+        # Reassign A1b2 to uuid2 — should evict C3d4's mapping
+        registry.reassign("A1b2", uuid2)
+        assert registry.get_uuid("A1b2") == normalize_uuid(uuid2)
+        assert registry.get_uuid("C3d4") is None
+        assert registry.get_short_id(uuid2) == "A1b2"
+
+    def test_reassign_missing_short_id(self):
+        registry = IdRegistry()
+        new_uuid = "abcdef12-3456-7890-abcd-ef1234567890"
+        # Reassign a short ID that was never registered — should still work
+        result = registry.reassign("X9y0", new_uuid)
+        assert result == "X9y0"
+        assert registry.get_uuid("X9y0") == normalize_uuid(new_uuid)
 
 
 class TestIdRegistryRoundtrip:
@@ -1050,7 +1087,7 @@ class TestParseInlineFormatting:
         assert spans[0].color == "blue_background"
 
     def test_equation(self):
-        spans = parse_inline_formatting("$E=mc^2$")
+        spans = parse_inline_formatting(":eq[E=mc^2]")
         assert len(spans) == 1
         assert spans[0].span_type == "equation"
         assert spans[0].expression == "E=mc^2"
@@ -1103,10 +1140,31 @@ class TestParseInlineFormatting:
         assert len(spans) == 1
         assert spans[0].text == "*not bold*"
 
-    def test_escaped_dollar(self):
-        spans = parse_inline_formatting("Price: \\$10")
+    def test_literal_dollar(self):
+        spans = parse_inline_formatting("Price: $10")
         assert len(spans) == 1
         assert spans[0].text == "Price: $10"
+
+    def test_dollar_expr_dollar_is_literal(self):
+        """Old $expr$ syntax should NOT trigger equation parsing."""
+        spans = parse_inline_formatting("$E=mc^2$")
+        assert all(s.span_type == "text" for s in spans)
+        combined = "".join(s.text for s in spans)
+        assert combined == "$E=mc^2$"
+
+    def test_multiple_dollar_signs(self):
+        spans = parse_inline_formatting("$50 and $100")
+        assert all(s.span_type == "text" for s in spans)
+        combined = "".join(s.text for s in spans)
+        assert combined == "$50 and $100"
+
+    def test_equation_with_dollar_in_text(self):
+        """Equation directive and literal dollar coexist."""
+        spans = parse_inline_formatting(":eq[x^2] costs $5")
+        assert spans[0].span_type == "equation"
+        assert spans[0].expression == "x^2"
+        text = "".join(s.text for s in spans[1:])
+        assert text == " costs $5"
 
     def test_mixed_formatting(self):
         spans = parse_inline_formatting("Normal **bold** and *italic*")
@@ -1368,7 +1426,7 @@ class TestDetectConflicts:
         assert "Line 2" in errors[0]
         assert "after=A1b2" in errors[0]
         assert "moved on line 1" in errors[0]
-        assert "ID will change" in errors[0]
+        assert "position may change" in errors[0]
 
     def test_after_references_deleted_block(self):
         """Using after=X where X is being deleted should error."""
@@ -1394,7 +1452,7 @@ class TestDetectConflicts:
         errors = _detect_conflicts(ops)
         assert len(errors) == 1
         assert "after=A1b2" in errors[0]
-        assert "ID will change" in errors[0]
+        assert "position may change" in errors[0]
 
     def test_same_parent_is_allowed(self):
         """Multiple ops adding to same parent should not conflict."""
@@ -2639,7 +2697,7 @@ class TestNotionRichTextToDnn:
         rich_text = [{"type": "equation", "equation": {
             "expression": "E = mc^2"
         }}]
-        assert notion_rich_text_to_dnn(rich_text) == "$E = mc^2$"
+        assert notion_rich_text_to_dnn(rich_text) == ":eq[E = mc^2]"
 
     def test_empty_rich_text(self):
         assert notion_rich_text_to_dnn([]) == ""
@@ -4700,3 +4758,36 @@ class TestParsePagePosition:
         assert op.title == "Test"
         assert op.icon == "📄"
         assert op.cover == "https://example.com/img.png"
+
+
+class TestApplyLineResultFormat:
+    """Tests for ApplyLineResult formatting, especially +db responses."""
+
+    def test_db_meta_format(self):
+        """db_meta produces +db=ID  props: ... format."""
+        lr = ApplyLineResult(
+            line=0, ok=True, op="+db",
+            created=["7QI8"],
+            db_meta={"id": "7QI8", "props": ["Name", "Status", "Due"]},
+        )
+        assert lr.db_meta is not None
+        props = ", ".join(lr.db_meta["props"])
+        line_text = f"{lr.line}: +db={lr.db_meta['id']}  props: {props}"
+        assert line_text == "0: +db=7QI8  props: Name, Status, Due"
+
+    def test_created_list_not_char_joined(self):
+        """created as list produces +ID, not +I +D."""
+        lr = ApplyLineResult(
+            line=0, ok=True, op="+row",
+            created=["aOlF"],
+        )
+        line_text = f"{lr.line}: +" + " +".join(lr.created)
+        assert line_text == "0: +aOlF"
+
+    def test_db_meta_none_for_regular_blocks(self):
+        """Non-database ops have no db_meta."""
+        lr = ApplyLineResult(
+            line=0, ok=True, op="+",
+            created=["A1b2", "C3d4"],
+        )
+        assert lr.db_meta is None
