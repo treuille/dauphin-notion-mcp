@@ -4,7 +4,7 @@ This MCP server gives Claude full read/write access to your Notion workspace.
 
 - **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
 - **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
-- **Broad block type coverage** — 16 block types, inline formatting, and database CRUD. Not universal yet (tables, synced blocks, and media are read-only).
+- **Broad block type coverage** — 16 block types, inline formatting, database CRUD, table read/write, column layouts, and database schema management. Not universal yet (synced blocks and media are read-only).
 
 ## How it works
 
@@ -104,13 +104,10 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Not yet supported
 
-- **Tables** — Notion tables (not databases) are read-only
 - **Synced blocks** — displayed as placeholder, can't create
 - **Images/video/files** — displayed as `!image` etc.; can't
   be created via the API
-- **Column layouts** — read-only
-- **Block equations** — read-only (inline `$math$` works)
-- **Database schema changes** — can't add/rename properties
+- **Block equations** — read-only (inline `:eq[expr]` works)
 
 ## Changelog
 
