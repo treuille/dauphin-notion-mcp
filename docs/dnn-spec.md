@@ -48,9 +48,10 @@ Normal parsing: extract ID, indent, marker, content.
 ### 3. Code Block Context
 
 When a block line contains ` ``` `:
-- Code block **starts** at `XXXX ```lang`
+- Code block **starts** at `XXXX ```lang` (3+ backticks)
 - Subsequent lines are **raw content** (no ID, no marker parsing)
-- Code block **ends** at a line containing only ` ``` ` at same indent
+- Code block **ends** at a line with backticks matching the opening length at same indent
+- The fence length auto-adjusts to avoid collision with backtick runs in content
 
 ````
 A1b2 ```python
@@ -232,8 +233,7 @@ When content starts with a marker character, escape it:
 | `` \` `` | `` ` `` | Not code |
 | `\[` | `[` | Not link start |
 | `\]` | `]` | Not link end |
-| `\:` | `:` | Not color directive |
-| `\$` | `$` | Not equation |
+| `\:` | `:` | Not color/equation directive |
 | `\→` | `→` | Arrow in link text |
 
 ### Arrows Mid-Line
@@ -253,7 +253,7 @@ Arrows need escaping only at line start or in `[link](url)` text:
 | `~~text~~` | ~~strikethrough~~ | |
 | `:u[text]` | underline | Directive (avoids `__` ambiguity) |
 | `` `text` `` | `code` | |
-| `$expr$` | equation | Inline LaTeX |
+| `:eq[expr]` | equation | Directive syntax |
 | `[text](url)` | link | |
 | `@p:A1b2` | page @mention | **USE THIS** |
 | `[text](p:A1b2)` | page link | Custom text only |
@@ -277,12 +277,20 @@ See @p:A1b2 for details.
 See [the docs](p:A1b2) for details.
 ```
 
+### Other Mention Types
+
+These Notion mention types render as standard links in DNN output:
+- **Database mentions** → `[db title](p:db_id)` (same syntax as page links)
+- **Link mentions** (rich URL embeds) → `[title](url)`
+- **Link previews** (integration embeds) → `[title](url)`
+- **Template mentions** (dynamic values like "today") → plain text
+
 ### Inline Equations
 
-- Inline equation: `$x = 5$` → renders as LaTeX
-- Literal dollar: `\$10` → renders as "$10"
+- Inline equation: `:eq[x = 5]` → renders as LaTeX
+- Dollar signs are literal text (no escaping needed): `$10` → "$10"
 
-Example: `The formula $E=mc^2$ costs \$10.`
+Example: `The formula :eq[E=mc^2] is famous.`
 
 ---
 
@@ -320,9 +328,8 @@ We classify by **move strategy**:
 Most blocks: paragraph, heading, list, toggle, quote, callout, etc.
 
 **How it works**: Read subtree → recreate under new parent → archive
-original. Block IDs **change** after move.
-
-The `m` command uses this strategy and returns `id_map`.
+original. Short IDs are **preserved** (reassigned to the new block UUIDs)
+so references remain valid after move.
 
 ### 2. Page-Movable Objects
 
@@ -436,19 +443,34 @@ Convert any reference to a Notion URL.
 
 ### Tool: notion_read
 
-Read pages or databases.
+Read pages or databases. Accepts a list of refs with per-ref overrides.
 
 | Param | Type | Default | Description |
 |:------|:-----|:--------|:------------|
-| `ref` | string | required | Page/DB/row ref |
-| `mode` | enum | `edit` | `edit`/`view` |
-| `depth` | int | 10 | Nesting depth |
-| `limit` | int | 50 | DB row limit |
+| `pages` | list[dict] | required | List of page/DB specs (see below) |
+| `depth` | int | 10 | Default nesting depth for pages |
+| `limit` | int | 50 | Default DB row limit |
+| `filter` | string | `""` | Default DB filter (see Filter DSL) |
+| `sort` | string | `""` | Default DB sort (see Sort DSL) |
+| `columns` | string | `""` | Default DB column selection |
+
+Each entry in `pages` is a dict:
+
+| Key | Type | Default | Description |
+|:----|:-----|:--------|:------------|
+| `ref` | string | required | Short ID, UUID, URL, or typed ref |
+| `mode` | enum | `"edit"` | `edit` (with IDs) or `view` (no IDs) |
+| `depth` | int | (global) | Override nesting depth for this ref |
+| `limit` | int | (global) | Override row limit for this ref |
+| `filter` | string | (global) | Override filter for this ref |
+| `sort` | string | (global) | Override sort for this ref |
+| `columns` | string | (global) | Override columns for this ref |
 
 **Returns for page:**
 ```
 @dnn 1
 @page 9a8b7c6d
+@icon 📋
 @title My Todo List
 
 A1b2 # Today
@@ -472,10 +494,84 @@ K1l2,Ship it,Done,2024-01-13,1
 ```
 
 Notes:
+- `@icon` = page icon (emoji or external URL), omitted if none
 - `@ds` = resolved data_source_id (required for queries)
 - `@cols` = column definitions for compact updates
 - Comma-separated values (CSV) with quote escaping
 - Row IDs are 4-char like block IDs
+
+#### Filter DSL
+
+Filter databases using a compact expression syntax:
+
+```
+Status = Done
+Title ~ bug
+Due < 2024-01-15
+Priority >= 3
+"Last Contact" >= -14d
+Status = Done & Due < 2024-01-15
+(Status = Done | Status = "In Progress") & Priority > 3
+Tags ~ urgent
+Notes ?
+Notes !?
+```
+
+**Operators:**
+
+| Op | Meaning | Applies To |
+|:---|:--------|:-----------|
+| `=` | equals | title, text, number, select, status, date, checkbox, url, email, phone |
+| `!=` | not equals | title, text, number, select, status, date, url, email, phone |
+| `~` | contains | title, text, multi_select, url, email, phone |
+| `!~` | does not contain | title, text, multi_select, url, email, phone |
+| `<` | less than | number, date, created_time, last_edited_time |
+| `>` | greater than | number, date, created_time, last_edited_time |
+| `<=` | less than or equal | number, date, created_time, last_edited_time |
+| `>=` | greater than or equal | number, date, created_time, last_edited_time |
+| `?` | is empty (unary) | most types |
+| `!?` | is not empty (unary) | most types |
+
+**Logic:** `&` (AND, binds tighter) and `|` (OR), with parentheses.
+
+**Values:**
+- Unquoted words: `Done`, `123`, `2024-01-15`
+- Quoted strings: `"In Progress"`, `"Has \"quotes\""`
+- Relative dates: `-7d` (7 days ago), `-14d` (14 days ago)
+- Checkbox: `1`/`0`, `true`/`false`, `yes`/`no`
+
+**Property names** with spaces must be quoted: `"Last Contact" >= -14d`
+
+**Grammar:**
+```
+expr     → and_expr ('|' and_expr)*
+and_expr → atom ('&' atom)*
+atom     → '(' expr ')' | predicate
+predicate→ PROPERTY OP VALUE
+         | PROPERTY '?' | PROPERTY '!?'
+```
+
+#### Sort DSL
+
+Comma-separated sort specs. Default direction is ascending.
+
+```
+Due desc
+Due desc, Status asc
+"Last Contact" asc
+Priority desc, Name
+```
+
+#### Columns DSL
+
+Comma-separated property names. Selects which columns to return.
+
+```
+Name, Status, Due
+"Last Contact", Priority
+```
+
+Property names are matched case-insensitively against the schema.
 
 ### Tool: notion_apply
 
@@ -502,7 +598,7 @@ All mutations in one script.
 x E5f6
 x G7h8 I9j0 K1l2
 
-# Move block (clone+archive, IDs change)
+# Move block (clone+archive, short IDs preserved)
 m M3n4 -> parent=O5p6
 m Q7r8 -> parent=S9t0 after=U1v2
 
@@ -528,6 +624,12 @@ t C9d0 = 0
 
 +page parent=A1b2 title="New Page" icon=📝 cover=https://example.com/img.jpg
   Content with icon and cover image.
+
+# Position: insert after a specific block
++page parent=A1b2 after=C3d4 title="After Page"
+
+# Position: insert at the start
++page parent=A1b2 pos=start title="First Page"
 
 # Create page in database
 +page parent=db:X1y2 title="New Task"
@@ -581,6 +683,50 @@ urow I9j0
 xrow K1l2
 ```
 
+#### Script Commands: Database Schema
+
+```
+# Create database with typed properties
++db parent=A1b2 title="Tasks"
+  Name(title)
+  Status(select: Todo|In Progress|Done)
+  Priority(select: High|Medium|Low)
+  Due(date)
+  Done(checkbox)
+  Notes(rich_text)
+  Score(number: number)
+
+# Create database with icon
++db parent=A1b2 title="Tracker" icon=📊
+  Name(title)
+  Status(status)
+
+# Add property to existing database
++prop db=X1y2 Priority(select: High|Medium|Low)
++prop db=X1y2 Due(date)
+
+# Delete property
+xprop db=X1y2 Priority
+xprop db=X1y2 "Property With Spaces"
+
+# Rename property
+uprop db=X1y2 OldName -> NewName
+uprop db=X1y2 "Old Name" -> "New Name"
+```
+
+**Property definition syntax:** `Name(type)` or `Name(type: config)`
+
+Supported property types: `title`, `rich_text`, `number`, `select`,
+`multi_select`, `status`, `date`, `checkbox`, `url`, `email`,
+`phone_number`, `created_time`, `last_edited_time`, `relation`.
+
+Select/multi_select options: `Status(select: Open|Closed|Blocked)`
+
+Number format: `Score(number: percent)`, `Price(number: dollar)`
+
+Note: Consecutive schema operations (`+prop`, `xprop`, `uprop`) on the
+same database execute sequentially to avoid race conditions.
+
 **Returns:** Compact multiline string (0-indexed line numbers):
 ```
 0: +Z1a2 +Z3b4    (created IDs)
@@ -594,8 +740,8 @@ xrow K1l2
 
 Errors appear as `N: err MESSAGE`. Moves/type-changes show `OLD→NEW`.
 
-**Important**: Moves are clone+archive; block IDs always change.
-The `→` shows old→new mapping for subsequent operations.
+**Important**: Moves are clone+archive, but short IDs are preserved
+(reassigned to the new block's UUID).
 
 ---
 
@@ -640,8 +786,9 @@ This provides significant speedup over sequential execution.
 3. **Parent/after are not conflicts** — Multiple ops can add to the same
    parent or use the same `after` anchor. Only direct targets conflict.
 
-4. **Move changes IDs** — The `m` command clones and archives; the new
-   block gets a new ID returned in `id_map`. The old ID becomes invalid.
+4. **Move preserves short IDs** — The `m` command clones and archives,
+   then reassigns the short ID to the new block UUID. References to the
+   moved block remain valid.
 
 ### Rate Limiting
 
@@ -703,8 +850,11 @@ if you need sequential dependency between operations.
 | `COPY_CONTAINS_UNSUPPORTED` | Page contains uncopyable content | No |
 | `INVALID_COVER_URL` | Cover must be external URL | No |
 | `MOVE_DATABASE` | Cannot move databases via API | No |
-| `CREATE_DATABASE` | Cannot create child DBs via API | No |
 | `CONFLICT_DETECTED` | Same block targeted by multiple ops | No |
+| `FILTER_ERROR` | Invalid filter DSL syntax | No |
+| `SORT_ERROR` | Invalid sort DSL syntax | No |
+| `COLUMNS_ERROR` | Invalid column selection | No |
+| `DB_PARAMS_ON_PAGE` | filter/sort/columns used on non-database ref | No |
 
 ### High-Value Autofixes
 
@@ -774,7 +924,7 @@ E5f6 The function above greets users.
 ```
 A1b2 **Bold**, *italic*, ~~struck~~, :u[underline], `code`.
 C3d4 Colors: :red[error], :green[success], :blue[info].
-E5f6 Math: The formula $E=mc^2$ costs \$10.
+E5f6 Math: The formula :eq[E=mc^2] — and it costs $10.
 G7h8 Links: [docs](https://x.com) and [page](p:I9j0).
 I9j0 Mentions: @user:abc123 and @date:2024-01-15.
 ```

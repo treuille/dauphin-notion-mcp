@@ -105,7 +105,7 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 ## Not yet supported
 
 - **Synced blocks** — displayed as placeholder, can't create
-- **Images/video/files** — displayed as `!image` etc.; can't
+- **Images/video/files** — displayed as `!image~` etc.; can't
   be created via the API
 - **Block equations** — read-only (inline `:eq[expr]` works)
 
