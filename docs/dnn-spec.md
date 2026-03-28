@@ -18,7 +18,8 @@ A simple paragraph "Hello World" returns ~400 chars of JSON.
 3. **Fixed 4-char IDs** - left-justified, session-scoped mapping
 4. **Per-span colors** - `:red[text]` [Streamlit-style](https://docs.streamlit.io/develop/api-reference/text/st.markdown) inline
 5. **Read-only mode** - omit IDs entirely for max compression
-6. **Opaque blocks** - unsupported types shown as `!type` placeholders
+6. **Opaque blocks** - unsupported types shown as `!type~` placeholders
+7. **Structural blocks** - container types (tables, columns) use `!type N` notation
 
 ---
 
@@ -136,8 +137,70 @@ To use marker chars as literal text, escape with backslash.
 | `⊞ ` | child_database | Page-backed (see below) |
 | `→ ` | link_to_page | Read-only |
 | ` ``` ` | code block start | |
-| `⫼N` | column_list | Read-only (N = column count) |
-| `║N` | column | Read-only (N = position) |
+| `!cols N` | column_list | Structural (N = column count) |
+| `!col N` | column | Structural (N = position, 1-indexed) |
+| `!table N` | table | Structural (N = column count) |
+| `\| c1 \| c2 \|` | table_row | Pipe-delimited cells |
+
+---
+
+## Structural Blocks
+
+Structural blocks use the `!type N` notation for container blocks that
+have editable structure (columns and tables). Unlike opaque blocks (`!type~`),
+structural blocks are fully read/write.
+
+| Marker | Notion Type | N Meaning |
+|:-------|:------------|:----------|
+| `!cols N` | column_list | Number of columns |
+| `!col N` | column | Column position (1-indexed) |
+| `!table N` | table | Number of columns (table_width) |
+
+**Bang (`!`) prefix disambiguation order** (first match wins):
+1. Colored callout: `!color text` (gray, blue, red, etc.)
+2. Opaque block: `!type~` or `!type~ (caption)`
+3. Structural block: `!type N` (where type is `cols`, `col`, or `table`)
+4. Default callout: `! text`
+
+### Tables
+
+Tables render as a `!table N` parent with pipe-delimited `table_row` children:
+
+```
+A1b2 !table 3
+C3d4   | Name | Status | Notes |
+E5f6   | Task one | Done | Shipped |
+G7h8   | Task two | In progress | On track |
+```
+
+**Auto-grouping**: When adding rows, consecutive pipe-delimited lines
+without an explicit `!table` parent are automatically grouped into a
+table. The column count is inferred from the first row:
+
+```
++ parent=A1b2
+  | Name | Status | Notes |
+  | Task one | Done | Shipped |
+  | Task two | In progress | On track |
+```
+
+Markdown separator rows (`|---|---|`) are silently dropped.
+
+Pipes within cell content must be escaped: `\|`.
+
+Table rows support full rich text (bold, links, colors, etc.) in cells.
+
+### Column Layouts
+
+Column layouts render as a `!cols N` parent with `!col N` children:
+
+```
+A1b2 !cols 2
+C3d4   !col 1
+E5f6     First column content
+G7h8   !col 2
+I9j0     Second column content
+```
 
 ---
 
@@ -286,7 +349,8 @@ The `~` suffix warns: "move may be lossy."
 ### 4. Complex-Structure Blocks
 
 Some blocks have creation constraints:
-- `column_list` — must have ≥2 columns on create
+- `column_list` (`!cols N`) — must have ≥2 columns on create
+- `table` (`!table N`) — must have ≥1 row on create
 - `synced_block` — has `synced_from` reference model
 
 These are clonable but require special handling.
@@ -295,12 +359,15 @@ These are clonable but require special handling.
 
 ## Opaque Blocks
 
-Unsupported block types rendered as `!type` placeholders:
+Unsupported block types rendered as `!type~` placeholders:
 
 - `image`, `video`, `file`, `pdf`, `bookmark`, `embed`
 - `link_preview`, `synced_block`, `link_to_page`
-- `table`, `table_row`, `table_of_contents`, `breadcrumb`
+- `table_of_contents`, `breadcrumb`
 - `equation`, `template`, `unsupported`
+
+Note: `table` and `table_row` are **not** opaque — they use structural
+notation with full read/write support (see Structural Blocks above).
 
 ```
 E5f6 !image~ (screenshot.png)
@@ -317,7 +384,8 @@ M3n4 ⊞ Tasks Database
 | `~` | Clone may be lossy (file URLs expire) |
 
 Note: `§` (child_page) and `⊞` (child_database) are page-backed.
-Column layouts use `⫼N` and `║N` markers (not opaque).
+Column layouts use `!cols N` and `!col N` structural markers (not opaque).
+Tables use `!table N` structural markers with pipe-delimited rows (not opaque).
 
 ### Opaque Read Modes *(not yet implemented)*
 
@@ -724,7 +792,40 @@ I9j0 Regular paragraph here.
 To update "Project Notes" title: `u C3d4 = "Project Documentation"`
 (Routes to Update Page endpoint internally.)
 
-### Example 5: Database with TSV
+### Example 5: Table
+
+```
+A1b2 !table 3
+C3d4   | Name | Status | Notes |
+E5f6   | Fix login bug | Done | Shipped v2.1 |
+G7h8   | Add dark mode | In progress | Design ready |
+```
+
+### Example 6: Column Layout
+
+```
+A1b2 !cols 2
+C3d4   !col 1
+E5f6     # Left Column
+G7h8     Some content on the left.
+I9j0   !col 2
+K1l2     # Right Column
+M3n4     Some content on the right.
+```
+
+### Example 7: Auto-Grouped Table (in notion_apply)
+
+```
++ parent=A1b2
+  | Name | Status | Notes |
+  | Task one | Done | Shipped |
+  | Task two | In progress | On track |
+```
+
+Consecutive pipe rows are auto-wrapped in a `!table N` parent.
+Markdown separator rows (`|---|---|---`) are silently dropped.
+
+### Example 8: Database with TSV
 
 ```
 @dnn 1
@@ -792,13 +893,17 @@ Check in order (first match wins):
 9. `N. ` → numbered_list
 10. `- ` → bulleted_list
 11. `> ` → toggle
-12. `| ` → quote
-13. `! ` → callout
-14. `§ ` → child_page
-15. `⊞ ` → child_database
-16. `→ ` → link_to_page
-17. ` ``` ` → code block
-18. (else) → paragraph
+12. `| ... |` → table_row (pipe-delimited with trailing `|`)
+13. `| ` → quote (pipe, no trailing `|`)
+14. `!color ` → colored callout
+15. `!type~` → opaque block
+16. `!type N` → structural block (cols, col, table)
+17. `! ` → default callout
+18. `§ ` → child_page
+19. `⊞ ` → child_database
+20. `→ ` → link_to_page
+21. ` ``` ` → code block
+22. (else) → paragraph
 
 ---
 
