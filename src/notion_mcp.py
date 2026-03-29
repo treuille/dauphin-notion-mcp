@@ -8,6 +8,8 @@ Token: Passed via --token-file <path> CLI argument at startup.
 """
 
 import asyncio
+from collections import Counter
+import difflib
 import logging
 import random
 import re
@@ -582,6 +584,20 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
                     )
 
             return block_type, matched_text, attrs.copy() if isinstance(attrs, dict) else attrs, warnings
+
+    # (d) Warn if content looks like a table command that won't create a table
+    if content.startswith('@table'):
+        warnings.append(
+            "@table is a read-only display format, not a write command. "
+            "To create a table, use consecutive | col | col | rows "
+            "(they auto-group into a table), or !table N with indented pipe rows."
+        )
+    # (f) Warn if !table without column count (parsed as default callout or paragraph)
+    elif re.match(r'^!table\s*$', content):
+        warnings.append(
+            "!table requires a column count (e.g. !table 6). Without it, this "
+            "becomes a plain paragraph. Use !table N or consecutive | col | col | rows."
+        )
 
     # Default: paragraph
     return 'paragraph', content, {}, warnings
@@ -3469,7 +3485,7 @@ MOVE_CMD_PATTERN = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)(?:\s+after=(\S+))
 ADD_CMD_EMPTY_AFTER = re.compile(r'^\+\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_EMPTY_AFTER = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_MISSING_PARENT = re.compile(r'^m\s+(\S+)\s+->\s+after=(\S+)$')
-UPDATE_CMD_PATTERN = re.compile(r'^u\s+(\S+)\s+=\s+"(.*)"\s*$')
+UPDATE_CMD_PATTERN = re.compile(r'^[ue]\s+(\S+)\s+=\s+"(.*)"\s*$')
 TOGGLE_CMD_PATTERN = re.compile(r'^t\s+(\S+)\s+=\s+([01])$')
 
 
@@ -4063,13 +4079,54 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # Unknown command
+        # Unknown command — try to identify what the user meant
+        _VALID_COMMANDS = ["+", "x", "m", "u", "e", "t", "+page", "mpage", "xpage", "upage", "cpage", "+row", "urow", "xrow", "+db", "+prop", "xprop", "uprop"]
+        _CMD_DESCRIPTIONS = {
+            "+": "add blocks", "x": "delete blocks", "m": "move block",
+            "u": "update block text", "e": "update block text (alias for u)",
+            "t": "toggle todo", "+page": "create page", "mpage": "move page",
+            "xpage": "archive page", "upage": "update page props",
+            "cpage": "copy page", "+row": "add DB row", "urow": "update DB row props",
+            "xrow": "delete DB row", "+db": "create database",
+            "+prop": "add DB property", "xprop": "delete DB property",
+            "uprop": "rename DB property",
+        }
+        # Common natural-language guesses agents make → correct command
+        _WORD_ALIASES = {
+            "edit": "u", "update": "u", "modify": "u", "set": "u",
+            "add": "+", "create": "+", "new": "+", "insert": "+",
+            "delete": "x", "remove": "x", "del": "x", "rm": "x",
+            "move": "m", "mv": "m",
+            "toggle": "t", "check": "t",
+            "addpage": "+page", "newpage": "+page", "createpage": "+page",
+            "deletepage": "xpage", "removepage": "xpage",
+            "movepage": "mpage",
+            "updatepage": "upage", "editpage": "upage",
+            "copypage": "cpage",
+            "addrow": "+row", "newrow": "+row", "createrow": "+row",
+            "updaterow": "urow", "editrow": "urow",
+            "deleterow": "xrow", "removerow": "xrow",
+        }
+        # Extract the attempted command word
+        attempted = line.split()[0] if line.split() else line[:10]
+        attempted_lower = attempted.lower()
+        # Check explicit aliases first, then fuzzy match
+        if attempted_lower in _WORD_ALIASES:
+            correct = _WORD_ALIASES[attempted_lower]
+            suggestion = f"Unknown command '{attempted}'. Did you mean: {correct} ({_CMD_DESCRIPTIONS.get(correct, '')})?"
+        else:
+            close = difflib.get_close_matches(attempted, _VALID_COMMANDS, n=3, cutoff=0.5)
+            if close:
+                hints = [f"{c} ({_CMD_DESCRIPTIONS.get(c, '')})" for c in close]
+                suggestion = f"Unknown command '{attempted}'. Did you mean: {', '.join(hints)}?"
+            else:
+                suggestion = f"Unknown command '{attempted}'"
         errors.append(DnnParseError(
             code="UNKNOWN_COMMAND",
-            message="Unknown apply command",
+            message=suggestion,
             line=line_num,
             excerpt=f"{line_num}|{line[:50]}",
-            suggestions=["Valid commands: +, x, m, u, t, +page, mpage, xpage, upage, cpage, +row, urow, xrow, +db, +prop, xprop, uprop"]
+            suggestions=["Valid commands: +, x, m, u (or e), t, +page, mpage, xpage, upage, cpage, +row, urow, xrow, +db, +prop, xprop, uprop"]
         ))
         i += 1
 
@@ -4157,6 +4214,11 @@ def _auto_group_table_rows(blocks: list[DnnBlock]) -> list[DnnBlock]:
     Consecutive table_row blocks at the same level that don't already
     have a table parent are wrapped in a synthetic !table N block.
     Separator rows (table_separator) are silently dropped.
+
+    When an explicit !table N block already exists (level L), any
+    table_row blocks at level L+1 immediately following it are
+    attached as its children instead of being wrapped in a new
+    synthetic table.
     """
     result = []
     i = 0
@@ -4168,7 +4230,21 @@ def _auto_group_table_rows(blocks: list[DnnBlock]) -> list[DnnBlock]:
             i += 1
             continue
 
-        # Check for consecutive table rows at same level
+        # Explicit !table N block — collect child rows directly
+        if block.block_type == 'table' and block.structural and not block.children:
+            child_level = block.level + 1
+            i += 1
+            rows = []
+            while i < len(blocks) and blocks[i].level == child_level and \
+                    blocks[i].block_type in ('table_row', 'table_separator'):
+                if blocks[i].block_type == 'table_row':
+                    rows.append(blocks[i])
+                i += 1
+            block.children = rows
+            result.append(block)
+            continue
+
+        # Check for consecutive table rows at same level (no explicit parent)
         if block.block_type == 'table_row':
             # Collect all consecutive table rows at this level
             rows = []
@@ -4651,6 +4727,7 @@ class ApplyLineResult:
     ok: bool
     op: str
     created: list[str] = field(default_factory=list)  # new IDs from add
+    created_types: list[str] = field(default_factory=list)  # block types for each created ID
     moved: Optional[tuple[str, str]] = None  # (old_id, new_id) from move
     replaced: Optional[tuple[str, str]] = None  # (old_id, new_id) from update with type change
     error: Optional[str] = None
@@ -5494,6 +5571,7 @@ async def execute_apply_op(
                 )
 
             created_ids = []
+            created_types = []
             pages_at_bottom = []
 
             # Create child pages via Create Page API (will appear at bottom)
@@ -5508,6 +5586,7 @@ async def execute_apply_op(
                     if page_id:
                         short_id = registry.register(page_id)
                         created_ids.append(short_id)
+                        created_types.append("child_page")
                         pages_at_bottom.append(block.content)
                 except httpx.HTTPStatusError as e:
                     return {}, f"Failed to create child page '{block.content}': {_http_error_detail(e, 200)}"
@@ -5546,18 +5625,20 @@ async def execute_apply_op(
 
                 created = await append_blocks_async(parent_uuid, notion_blocks, after_uuid)
 
+                created_types = []
                 for block in created[:num_created]:
                     block_id = block.get("id", "")
                     if block_id:
                         short_id = registry.register(block_id)
                         created_ids.append(short_id)
+                        created_types.append(block.get("type", "unknown"))
 
             # Collect warnings from all content blocks
             all_warnings = []
             for block in op.content_blocks:
                 all_warnings.extend(block.warnings)
 
-            result: dict = {"op": "+", "parent": op.parent, "created": created_ids}
+            result: dict = {"op": "+", "parent": op.parent, "created": created_ids, "created_types": created_types}
             if pages_at_bottom:
                 result["pages_at_bottom"] = pages_at_bottom
             if all_warnings:
@@ -6486,15 +6567,18 @@ async def execute_apply_script(
     parse_result = parse_apply_script(script, registry)
 
     if parse_result.errors:
-        # Return parse error as a line result
+        # Return parse error as a line result (include suggestions)
         err = parse_result.errors[0]
+        error_msg = err.message
+        if err.suggestions:
+            error_msg += ". " + "; ".join(err.suggestions)
         return ApplyResult(
             ok=False,
             results=[ApplyLineResult(
                 line=err.line,
                 ok=False,
                 op="parse",
-                error=err.message
+                error=error_msg
             )]
         )
 
@@ -6641,10 +6725,11 @@ async def execute_apply_script(
                 error=error
             ))
         else:
-            # Extract created IDs and moved mapping
+            # Extract created IDs and block types
             created = op_result.get("created", [])
             if isinstance(created, str):
                 created = [created]
+            created_types = op_result.get("created_types", [])
 
             # Extract database metadata (+db response)
             db_meta = None
@@ -6675,6 +6760,7 @@ async def execute_apply_script(
                 ok=True,
                 op=op.command.value,
                 created=created,
+                created_types=created_types,
                 moved=moved,
                 replaced=replaced,
                 pages_at_bottom=pages_at_bottom,
@@ -7179,6 +7265,12 @@ async def notion_apply(
 ) -> str:
     """Execute mutations on Notion pages.
 
+    Quick Reference (use script="help" for compact version):
+        BLOCKS:  +  x  m  u (or e)  t
+        PAGES:   +page  xpage  mpage  upage  cpage
+        ROWS:    +row  urow  xrow
+        SCHEMA:  +db  +prop  xprop  uprop
+
     PARAMETER: Use `script` (not `operations`, `action`, or `commands`).
 
     Args:
@@ -7193,7 +7285,7 @@ async def notion_apply(
         x ID [ID2 ID3...]         Delete/archive blocks
         m ID -> parent=ID [after=ID]  Move block (parent= always required,
                                        even for same-parent reposition)
-        u ID = "text"             Update block text (can change type!)
+        u ID = "text"             Update block text (alias: e) (can change type!)
         t ID = 0|1                Toggle todo checkbox
 
     Update with Type Change:
@@ -7336,21 +7428,29 @@ async def notion_apply(
         u Text1 = "Updated with **bold** and :green[color]"
         t Todo1 = 1
 
-    Example - Table (auto-grouped from consecutive pipe rows):
+    CREATING TABLES — Two equivalent approaches:
+
+    Approach 1 (RECOMMENDED) - Consecutive pipe rows auto-group:
         + parent=A1b2
           | Name | Status | Notes |
           | Task one | Done | Shipped |
           | Task two | In progress | On track |
 
-        Consecutive pipe rows auto-group into a Notion table.
-        Separator rows (|---|---|) are silently dropped.
+        Consecutive | col | col | rows auto-group into a Notion table.
+        This is the simplest approach. No !table marker needed.
         Cells support rich text: **bold**, [links](url), etc.
+        Separator rows (|---|---|) are silently dropped.
 
-    Example - Explicit table with !table marker:
+    Approach 2 - Explicit !table N marker (N = column count):
         + parent=A1b2
           !table 3
           | Name | Status | Notes |
           | Task one | Done | Shipped |
+
+    COMMON MISTAKES (these create paragraphs, NOT tables):
+        @table ...      ← @table is read-only display format
+        !table ...      ← missing column count, needs !table N
+        Camp | For | Ages    ← missing outer pipes: | Camp | For | Ages |
 
     Example - Database row with date range:
         +row db=TasksDB
@@ -7365,6 +7465,40 @@ async def notion_apply(
     if len(provided) > 1:
         raise ValueError(f"Use only one of script/operations/action, got: {', '.join(provided)}")
     resolved = script or operations or action
+
+    # Help command: return compact command reference
+    if resolved.strip().lower() in ("help", "?"):
+        return (
+            "notion_apply commands:\n"
+            "\n"
+            "BLOCKS:\n"
+            "  + parent=ID [after=ID]       Add blocks (content indented below)\n"
+            "  x ID [ID2...]                Delete/archive blocks\n"
+            "  m ID -> parent=ID [after=ID] Move block\n"
+            "  u ID = \"text\"               Update block text (alias: e)\n"
+            "  t ID = 0|1                   Toggle todo checkbox\n"
+            "\n"
+            "PAGES:\n"
+            "  +page parent=ID title=\"T\"    Create page\n"
+            "  xpage ID                     Archive page\n"
+            "  mpage ID -> parent=ID        Move page\n"
+            "  upage ID [= \"T\"] [icon=X]   Update page title/icon/cover\n"
+            "  cpage ID -> parent=ID        Copy page\n"
+            "\n"
+            "DB ROWS:\n"
+            "  +row db=ID                   Add row (props indented below)\n"
+            "    Title=val\\tStatus=Done     (tab-separated key=value pairs)\n"
+            "  urow ID                      Update row props (props indented below)\n"
+            "  xrow ID                      Delete row\n"
+            "\n"
+            "DB SCHEMA:\n"
+            "  +db parent=ID title=\"T\"      Create database (props indented below)\n"
+            "  +prop db=ID Name(type)       Add property\n"
+            "  xprop db=ID Name             Delete property\n"
+            "  uprop db=ID Old -> \"New\"     Rename property\n"
+            "\n"
+            "Use dry_run=true to validate without executing."
+        )
 
     result = await execute_apply_script(
         resolved,
@@ -7383,8 +7517,14 @@ async def notion_apply(
                 line_text = f"{lr.line}: +db={lr.db_meta['id']}  props: {props}"
                 lines.append(line_text)
             elif lr.created:
-                # +ID1 +ID2 for created blocks
-                line_text = f"{lr.line}: +" + " +".join(lr.created)
+                # +ID1(type) +ID2(type) for created blocks
+                parts = []
+                for j, cid in enumerate(lr.created):
+                    if j < len(lr.created_types):
+                        parts.append(f"+{cid}({lr.created_types[j]})")
+                    else:
+                        parts.append(f"+{cid}")
+                line_text = f"{lr.line}: " + " ".join(parts)
                 if lr.pages_at_bottom:
                     # Indicate which pages were created at bottom (no positioning)
                     line_text += f" (at bottom: {', '.join(lr.pages_at_bottom)})"
@@ -7410,11 +7550,27 @@ async def notion_apply(
         else:
             lines.append(f"{lr.line}: err {lr.error}")
 
+    # (c) Type summary: collect all created block types across all results
+    all_types: Counter[str] = Counter()
+    for lr in result.results:
+        if lr.ok and lr.created_types:
+            all_types.update(lr.created_types)
+
     # Summary line
     ok_count = sum(1 for lr in result.results if lr.ok)
     total = len(result.results)
     lines.append("---")
-    lines.append(f"{ok_count}/{total} ok")
+    summary_parts = [f"{ok_count}/{total} ok"]
+    if all_types:
+        type_strs = [f"{count} {typ}" for typ, count in all_types.most_common()]
+        summary_parts.append(f"created: {', '.join(type_strs)}")
+    lines.append("  ".join(summary_parts))
+
+    # (b) Warn if script mentions 'table' but no table block was created
+    script_lower = resolved.lower()
+    if ('table' in script_lower or '|' in resolved) and all_types and 'table' not in all_types:
+        lines.append("⚠ script mentions 'table' or has pipe rows but no table was created (only: "
+                      + ", ".join(all_types.keys()) + ")")
 
     return "\n".join(lines)
 

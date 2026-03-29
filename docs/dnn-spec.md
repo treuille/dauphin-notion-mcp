@@ -233,7 +233,7 @@ When content starts with a marker character, escape it:
 | `\[` | `[` | Not link start |
 | `\]` | `]` | Not link end |
 | `\:` | `:` | Not color directive |
-| `\$` | `$` | Not equation |
+| `\$` | `$` | Literal dollar sign |
 | `\→` | `→` | Arrow in link text |
 
 ### Arrows Mid-Line
@@ -253,7 +253,7 @@ Arrows need escaping only at line start or in `[link](url)` text:
 | `~~text~~` | ~~strikethrough~~ | |
 | `:u[text]` | underline | Directive (avoids `__` ambiguity) |
 | `` `text` `` | `code` | |
-| `$expr$` | equation | Inline LaTeX |
+| `:eq[expr]` | equation | Inline LaTeX directive |
 | `[text](url)` | link | |
 | `@p:A1b2` | page @mention | **USE THIS** |
 | `[text](p:A1b2)` | page link | Custom text only |
@@ -279,10 +279,10 @@ See [the docs](p:A1b2) for details.
 
 ### Inline Equations
 
-- Inline equation: `$x = 5$` → renders as LaTeX
-- Literal dollar: `\$10` → renders as "$10"
+- Inline equation: `:eq[x = 5]` → renders as LaTeX
+- Dollar signs are literal text: `$10` renders as "$10"
 
-Example: `The formula $E=mc^2$ costs \$10.`
+Example: `The formula :eq[E=mc^2] costs $10.`
 
 ---
 
@@ -483,8 +483,10 @@ All mutations in one script.
 
 | Param | Type | Default | Description |
 |:------|:-----|:--------|:------------|
-| `script` | string | required | Edit commands |
+| `script` | string | required | Edit commands (or `"help"` for command reference) |
 | `dry_run` | bool | false | Validate only |
+
+Pass `script="help"` to get a compact command reference without executing anything.
 
 #### Script Commands: Blocks
 
@@ -506,9 +508,10 @@ x G7h8 I9j0 K1l2
 m M3n4 -> parent=O5p6
 m Q7r8 -> parent=S9t0 after=U1v2
 
-# Update block text
+# Update block text (alias: e)
 u W3x4 = "Updated text here"
 u Y5z6 = "Text with :red[color] and **bold**"
+e A1b2 = "Same as u — edit is an alias"
 
 # Toggle todo checkbox
 t A7b8 = 1
@@ -774,7 +777,7 @@ E5f6 The function above greets users.
 ```
 A1b2 **Bold**, *italic*, ~~struck~~, :u[underline], `code`.
 C3d4 Colors: :red[error], :green[success], :blue[info].
-E5f6 Math: The formula $E=mc^2$ costs \$10.
+E5f6 Math: The formula :eq[E=mc^2] costs $10.
 G7h8 Links: [docs](https://x.com) and [page](p:I9j0).
 I9j0 Mentions: @user:abc123 and @date:2024-01-15.
 ```

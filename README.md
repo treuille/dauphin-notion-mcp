@@ -111,6 +111,16 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
+### 2026-03-29
+
+- **`e` alias for block updates** — `e ID = "text"` is now accepted as an alias for `u`, matching natural "edit" intent.
+- **`help` command** — `script="help"` returns a compact command reference without executing anything.
+- **Smarter unknown-command errors** — unrecognized commands now get fuzzy-matched against valid commands and common natural-language aliases (e.g., `edit` → `u`, `delete` → `x`), with "did you mean?" suggestions.
+- **Explicit `!table N` child rows** — when using `!table N` with indented pipe rows, the rows are now correctly attached as children of the explicit table block instead of being wrapped in a second synthetic table.
+- **Table creation guardrails** — warnings for common mistakes: `@table` (read-only format, not a write command), `!table` without a column count, and pipe rows missing outer pipes.
+- **Typed creation responses** — `+` results now include block types (e.g., `+A1b2(paragraph) +C3d4(to_do)`), with a type summary in the footer.
+- **Parse error suggestions** — error messages now include suggestion text inline, so the fix is visible without inspecting the structured error.
+
 ### 2026-03-14
 
 - **Equation syntax** — inline equations now use `:eq[expr]` directive instead of `$expr$`. Dollar signs are treated as literal text, so `$50` no longer triggers equation parsing.
