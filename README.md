@@ -111,6 +111,10 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
+### 2026-03-30
+
+- **Null-field stripping on write** — block data returned by the Notion API sometimes contains `null`-valued fields (e.g., `icon: null`). These are now stripped before writing, since the API rejects explicit nulls but accepts absent fields. Fixes errors when cloning or moving certain block types.
+
 ### 2026-03-29
 
 - **`e` alias for block updates** — `e ID = "text"` is now accepted as an alias for `u`, matching natural "edit" intent.

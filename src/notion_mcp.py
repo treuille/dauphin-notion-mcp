@@ -5032,6 +5032,8 @@ def _sanitize_block_for_write(
     """Sanitize a block's type_data for writing to Notion API.
 
     Finds and sanitizes rich_text arrays within the block data.
+    Strips None-valued fields that Notion returns on read but
+    rejects on write (e.g., icon: null, description: null).
 
     Args:
         block_type: The block type (e.g., "paragraph", "toggle").
@@ -5041,6 +5043,13 @@ def _sanitize_block_for_write(
         Tuple of (sanitized_type_data, warnings).
     """
     warnings: list[str] = []
+
+    # Strip None-valued fields. The Notion API returns these on read
+    # (e.g., "icon": null) but rejects them on write — it expects the
+    # field to be absent rather than explicitly null.
+    null_keys = [k for k, v in type_data.items() if v is None]
+    for k in null_keys:
+        del type_data[k]
 
     # Most block types have rich_text at the top level
     if "rich_text" in type_data:
