@@ -1562,6 +1562,127 @@ class TestApplyScriptErrorPropagation:
         assert result.operations[0].command == ApplyCommand.ADD
         assert result.operations[0].after is None
 
+    def test_u_unquoted_text(self):
+        """u ID = unquoted text (no quotes) should parse."""
+        script = 'u AbCd = - Updated content here'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+        assert result.operations[0].command == ApplyCommand.UPDATE
+        assert result.operations[0].target == "AbCd"
+        assert result.operations[0].new_text == "- Updated content here"
+
+    def test_u_unquoted_with_special_chars(self):
+        """u ID = unquoted text with DNN formatting should parse."""
+        script = 'u kSew = - :gray[**☁︎**]** 1L of water/day?** Y'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert result.operations[0].new_text == "- :gray[**☁︎**]** 1L of water/day?** Y"
+
+    def test_u_quoted_still_works(self):
+        """u ID = "quoted text" should still work (backward compat)."""
+        script = 'u AbCd = "- Some text"'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert result.operations[0].new_text == "- Some text"
+
+    def test_u_quoted_escape_sequences(self):
+        """Quoted form still decodes escape sequences."""
+        script = 'u AbCd = "line1\\nline2"'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert result.operations[0].new_text == "line1\nline2"
+
+    def test_u_indented_content(self):
+        """u ID followed by indented content on next line should parse."""
+        script = 'u AbCd\n  - Updated content here'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert len(result.operations) == 1
+        assert result.operations[0].command == ApplyCommand.UPDATE
+        assert result.operations[0].target == "AbCd"
+        assert result.operations[0].new_text == "- Updated content here"
+
+    def test_e_indented_content(self):
+        """e (alias) with indented content should also work."""
+        script = 'e AbCd\n  - Updated via e'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 0
+        assert result.operations[0].command == ApplyCommand.UPDATE
+        assert result.operations[0].new_text == "- Updated via e"
+
+    def test_u_bare_missing_payload_error(self):
+        """u ID with no content anywhere should give helpful error."""
+        script = 'u AbCd'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert "requires an indented payload" in result.errors[0].message
+
+    def test_u_bare_non_indented_next_line_error(self):
+        """u ID followed by non-indented content should error."""
+        script = 'u AbCd\nx EfGh'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        # Should error on the u command (missing payload) and parse x separately
+        assert any("u" in e.message for e in result.errors)
+
+    def test_syntax_error_on_known_command(self):
+        """Bad syntax on a known command gives SYNTAX_ERROR, not UNKNOWN_COMMAND."""
+        script = 't AbCd'  # missing = 0|1
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "SYNTAX_ERROR"
+        assert "Syntax error on 't'" in result.errors[0].message
+        assert "Expected:" in result.errors[0].message
+        assert "Example:" in result.errors[0].suggestions[0]
+
+    def test_syntax_error_on_m_bad_format(self):
+        """m with wrong format gives syntax help, not 'Unknown command m'."""
+        script = 'm AbCd EfGh'  # missing -> parent=
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "SYNTAX_ERROR"
+        assert "parent=" in result.errors[0].message
+
+    def test_word_alias_includes_syntax(self):
+        """Natural-language alias like 'edit' now includes syntax hint."""
+        script = 'edit AbCd some text'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "UNKNOWN_COMMAND"
+        assert "Did you mean 'u'" in result.errors[0].message
+        assert "Syntax:" in result.errors[0].message
+
+    def test_truly_unknown_command(self):
+        """Completely unknown command still gives UNKNOWN_COMMAND."""
+        script = 'zzzzz AbCd'
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        assert len(result.errors) == 1
+        assert result.errors[0].code == "UNKNOWN_COMMAND"
+
 
 # =============================================================================
 # Property Value Builder Tests

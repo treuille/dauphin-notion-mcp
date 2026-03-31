@@ -111,6 +111,13 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
+### 2026-03-31
+
+- **Flexible update syntax** — `u`/`e` now accepts three forms: quoted (`u ID = "text"`), unquoted (`u ID = text`), and indented (`u ID` with content on the next indented line). Previously only quoted was supported.
+- **Syntax error hints** — when a known command is used with wrong syntax, the error now shows the expected format and an example, instead of reporting it as an unknown command.
+- **Code fence language with spaces** — code blocks now accept multi-word language hints (e.g., `` ```plain text ``), which were previously rejected.
+- **Server version in auth check** — `notion_check_auth` now includes the server's git short hash in its response for easier debugging.
+
 ### 2026-03-30
 
 - **Null-field stripping on write** — block data returned by the Notion API sometimes contains `null`-valued fields (e.g., `icon: null`). These are now stripped before writing, since the API rejects explicit nulls but accepts absent fields. Fixes errors when cloning or moving certain block types.

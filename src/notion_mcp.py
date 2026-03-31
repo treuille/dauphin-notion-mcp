@@ -14,6 +14,7 @@ import logging
 import random
 import re
 import string
+import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,6 +24,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger("notion-mcp")
+
+# Server version — git short hash at import time
+try:
+    _SERVER_VERSION = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=Path(__file__).parent.parent,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).strip()
+except Exception:
+    _SERVER_VERSION = "unknown"
 
 # =============================================================================
 # Async Rate Limiting
@@ -475,8 +487,8 @@ BLOCK_MARKERS = [
     (re.compile(r'^⊞ (.*)$'), 'child_database', {}),
     # Link to page
     (re.compile(r'^→ (.*)$'), 'link_to_page', {}),
-    # Code block start (3+ backticks, optional language)
-    (re.compile(r'^`{3,}(\w*)$'), 'code', {}),
+    # Code block start (3+ backticks, optional language — may contain spaces e.g. "plain text")
+    (re.compile(r'^`{3,}(.*)$'), 'code', {}),
 ]
 
 
@@ -568,7 +580,8 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
             elif block_type == 'numbered_list_item':
                 matched_text = match.group(2)
             elif block_type == 'code':
-                return block_type, '', {'language': match.group(1) or None}, warnings
+                lang = match.group(1).strip() or None
+                return block_type, '', {'language': lang}, warnings
             elif block_type == 'divider':
                 return block_type, '', attrs.copy(), warnings
             else:
@@ -3485,7 +3498,9 @@ MOVE_CMD_PATTERN = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)(?:\s+after=(\S+))
 ADD_CMD_EMPTY_AFTER = re.compile(r'^\+\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_EMPTY_AFTER = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_MISSING_PARENT = re.compile(r'^m\s+(\S+)\s+->\s+after=(\S+)$')
-UPDATE_CMD_PATTERN = re.compile(r'^[ue]\s+(\S+)\s+=\s+"(.*)"\s*$')
+UPDATE_CMD_QUOTED = re.compile(r'^[ue]\s+(\S+)\s+=\s+"(.*)"\s*$')
+UPDATE_CMD_UNQUOTED = re.compile(r'^[ue]\s+(\S+)\s+=\s+(.+)$')
+UPDATE_CMD_BARE = re.compile(r'^[ue]\s+(\S+)\s*$')
 TOGGLE_CMD_PATTERN = re.compile(r'^t\s+(\S+)\s+=\s+([01])$')
 
 
@@ -3714,7 +3729,7 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                     content_lines.append(content_line)
                     # Check if this line opens a code block
                     stripped_cl = content_line.lstrip()
-                    fence_match = re.match(r'^(`{3,})\w*$', stripped_cl)
+                    fence_match = re.match(r'^(`{3,})', stripped_cl)
                     if fence_match:
                         in_code_block = True
                         code_fence_count = len(fence_match.group(1))
@@ -3754,10 +3769,10 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # u ID = "new text"
-        match = UPDATE_CMD_PATTERN.match(line)
+        # u ID = "new text" | u ID = new text | u ID\n  indented text
+        match = UPDATE_CMD_QUOTED.match(line)
         if match:
-            # Decode escape sequences (\n, \t, \\, \") in the text
+            # Decode escape sequences (\n, \t, \\, \") in quoted text
             decoded_text = _decode_escape_sequences(match.group(2))
             op = ApplyOp(
                 command=ApplyCommand.UPDATE,
@@ -3767,6 +3782,37 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             )
             operations.append(op)
             i += 1
+            continue
+        match = UPDATE_CMD_UNQUOTED.match(line)
+        if match:
+            op = ApplyOp(
+                command=ApplyCommand.UPDATE,
+                line_num=line_num,
+                target=match.group(1),
+                new_text=match.group(2).rstrip()
+            )
+            operations.append(op)
+            i += 1
+            continue
+        match = UPDATE_CMD_BARE.match(line)
+        if match:
+            # u ID with indented content on next line
+            op = ApplyOp(
+                command=ApplyCommand.UPDATE,
+                line_num=line_num,
+                target=match.group(1),
+            )
+            i += 1
+            if i < len(lines) and lines[i] and lines[i][0] in ' \t':
+                op.new_text = lines[i].strip()
+                i += 1
+            else:
+                err = _check_missing_payload(
+                    lines, i, "u", line_num,
+                    r'.+', '- Updated content here')
+                if err:
+                    errors.append(err)
+            operations.append(op)
             continue
 
         # t ID = 0|1
@@ -3814,7 +3860,7 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                 elif content_line and content_line[0] in ' \t':
                     content_lines.append(content_line)
                     stripped_cl = content_line.lstrip()
-                    fence_match = re.match(r'^(`{3,})\w*$', stripped_cl)
+                    fence_match = re.match(r'^(`{3,})', stripped_cl)
                     if fence_match:
                         in_code_block = True
                         code_fence_count = len(fence_match.group(1))
@@ -4079,8 +4125,66 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # Unknown command — try to identify what the user meant
-        _VALID_COMMANDS = ["+", "x", "m", "u", "e", "t", "+page", "mpage", "xpage", "upage", "cpage", "+row", "urow", "xrow", "+db", "+prop", "xprop", "uprop"]
+        # Syntax error on known command, or truly unknown command
+        attempted = line.split()[0] if line.split() else line[:10]
+        attempted_lower = attempted.lower()
+
+        # Syntax hints for known commands — shown when the command token
+        # is recognised but the full line doesn't match the command's regex.
+        _CMD_SYNTAX = {
+            "+":     ('+ parent=PARENT [after=SIBLING]',
+                      '+ parent=AbCd after=EfGh'),
+            "x":     ('x BLOCK_ID [BLOCK_ID ...]',
+                      'x AbCd EfGh'),
+            "m":     ('m SOURCE -> parent=PARENT [after=SIBLING]',
+                      'm AbCd -> parent=EfGh after=IjKl'),
+            "u":     ('u BLOCK_ID = "new text"  OR  u BLOCK_ID\\n  new text',
+                      'u AbCd = "- Updated content"'),
+            "e":     ('e BLOCK_ID = "new text"  OR  e BLOCK_ID\\n  new text',
+                      'e AbCd = "- Updated content"'),
+            "t":     ('t BLOCK_ID = 0|1',
+                      't AbCd = 1'),
+            "+page": ('+page parent=PARENT title="Title"',
+                      '+page parent=AbCd title="My Page"'),
+            "mpage": ('mpage PAGE_ID -> parent=PARENT',
+                      'mpage AbCd -> parent=EfGh'),
+            "xpage": ('xpage PAGE_ID',
+                      'xpage AbCd'),
+            "upage": ('upage PAGE_ID\\n  Property=Value',
+                      'upage AbCd'),
+            "cpage": ('cpage PAGE_ID -> parent=PARENT',
+                      'cpage AbCd -> parent=EfGh'),
+            "+row":  ('+row db=DB_ID\\n  Property=Value',
+                      '+row db=AbCd'),
+            "urow":  ('urow ROW_ID\\n  Property=Value',
+                      'urow AbCd'),
+            "xrow":  ('xrow ROW_ID',
+                      'xrow AbCd'),
+            "+db":   ('+db parent=PARENT title="Title"\\n  PropName(type)',
+                      '+db parent=AbCd title="Tasks"'),
+            "+prop": ('+prop db=DB_ID PropName(type)',
+                      '+prop db=AbCd Status(select)'),
+            "xprop": ('xprop db=DB_ID "Property Name"',
+                      'xprop db=AbCd "Old Prop"'),
+            "uprop": ('uprop db=DB_ID "Old Name" -> "New Name"',
+                      'uprop db=AbCd "Status" -> "State"'),
+        }
+
+        # Check if this is a known command with bad syntax
+        if attempted_lower in _CMD_SYNTAX:
+            expected, example = _CMD_SYNTAX[attempted_lower]
+            errors.append(DnnParseError(
+                code="SYNTAX_ERROR",
+                message=f"Syntax error on '{attempted}'. Expected: {expected}",
+                line=line_num,
+                excerpt=f"{line_num}|{line[:50]}",
+                suggestions=[f"Example: {example}"],
+            ))
+            i += 1
+            continue
+
+        # Truly unknown command — try aliases and fuzzy match
+        _VALID_COMMANDS = list(_CMD_SYNTAX.keys())
         _CMD_DESCRIPTIONS = {
             "+": "add blocks", "x": "delete blocks", "m": "move block",
             "u": "update block text", "e": "update block text (alias for u)",
@@ -4091,7 +4195,6 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             "+prop": "add DB property", "xprop": "delete DB property",
             "uprop": "rename DB property",
         }
-        # Common natural-language guesses agents make → correct command
         _WORD_ALIASES = {
             "edit": "u", "update": "u", "modify": "u", "set": "u",
             "add": "+", "create": "+", "new": "+", "insert": "+",
@@ -4107,13 +4210,10 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             "updaterow": "urow", "editrow": "urow",
             "deleterow": "xrow", "removerow": "xrow",
         }
-        # Extract the attempted command word
-        attempted = line.split()[0] if line.split() else line[:10]
-        attempted_lower = attempted.lower()
-        # Check explicit aliases first, then fuzzy match
         if attempted_lower in _WORD_ALIASES:
             correct = _WORD_ALIASES[attempted_lower]
-            suggestion = f"Unknown command '{attempted}'. Did you mean: {correct} ({_CMD_DESCRIPTIONS.get(correct, '')})?"
+            expected, example = _CMD_SYNTAX[correct]
+            suggestion = f"Unknown command '{attempted}'. Did you mean '{correct}'? Syntax: {expected}"
         else:
             close = difflib.get_close_matches(attempted, _VALID_COMMANDS, n=3, cutoff=0.5)
             if close:
@@ -7102,7 +7202,8 @@ def notion_check_auth() -> str:
 
         return (
             f"authenticated as '{bot_name}' ({bot_type}) "
-            f"in workspace '{workspace_name}'"
+            f"in workspace '{workspace_name}' "
+            f"(server {_SERVER_VERSION})"
         )
 
     except httpx.HTTPStatusError as e:
