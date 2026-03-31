@@ -14,7 +14,6 @@ import logging
 import random
 import re
 import string
-import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -25,14 +24,10 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("notion-mcp")
 
-# Server version — git short hash at import time
+# Server version from package metadata (set in pyproject.toml)
 try:
-    _SERVER_VERSION = subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=Path(__file__).parent.parent,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    ).strip()
+    from importlib.metadata import version as _pkg_version
+    _SERVER_VERSION = f"v{_pkg_version('dauphin-notion-mcp')}"
 except Exception:
     _SERVER_VERSION = "unknown"
 

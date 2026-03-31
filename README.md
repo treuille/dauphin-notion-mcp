@@ -111,18 +111,18 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 
 ## Changelog
 
-### 2026-03-31
+### v0.2.0 — 2026-03-31
 
 - **Flexible update syntax** — `u`/`e` now accepts three forms: quoted (`u ID = "text"`), unquoted (`u ID = text`), and indented (`u ID` with content on the next indented line). Previously only quoted was supported.
 - **Syntax error hints** — when a known command is used with wrong syntax, the error now shows the expected format and an example, instead of reporting it as an unknown command.
 - **Code fence language with spaces** — code blocks now accept multi-word language hints (e.g., `` ```plain text ``), which were previously rejected.
-- **Server version in auth check** — `notion_check_auth` now includes the server's git short hash in its response for easier debugging.
+- **Server version in auth check** — `notion_check_auth` now includes the server version (from pyproject.toml) in its response for easier debugging.
 
-### 2026-03-30
+### v0.1.3 — 2026-03-30
 
 - **Null-field stripping on write** — block data returned by the Notion API sometimes contains `null`-valued fields (e.g., `icon: null`). These are now stripped before writing, since the API rejects explicit nulls but accepts absent fields. Fixes errors when cloning or moving certain block types.
 
-### 2026-03-29
+### v0.1.2 — 2026-03-29
 
 - **`e` alias for block updates** — `e ID = "text"` is now accepted as an alias for `u`, matching natural "edit" intent.
 - **`help` command** — `script="help"` returns a compact command reference without executing anything.
@@ -132,7 +132,7 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 - **Typed creation responses** — `+` results now include block types (e.g., `+A1b2(paragraph) +C3d4(to_do)`), with a type summary in the footer.
 - **Parse error suggestions** — error messages now include suggestion text inline, so the fix is visible without inspecting the structured error.
 
-### 2026-03-14
+### v0.1.1 — 2026-03-14
 
 - **Equation syntax** — inline equations now use `:eq[expr]` directive instead of `$expr$`. Dollar signs are treated as literal text, so `$50` no longer triggers equation parsing.
 - **Stable move IDs** — moving a block preserves its short ID instead of assigning a new one, so references to moved blocks remain valid.
@@ -140,13 +140,13 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 - **`+row` response format** — `+row` results now return created IDs as a list, consistent with other creation commands.
 - **ID registry reassign** — new `reassign()` method on the ID registry supports re-pointing a short ID to a different UUID, used internally by move operations.
 
-### 2026-02-20
+### v0.1.0 — 2026-02-20
 
 - **Missing payload diagnostics** — `+row`, `urow`, and `+db` now detect missing or non-indented payloads and produce actionable error messages with autofix suggestions, instead of silently accepting incomplete commands.
 - **Sequential schema execution** — consecutive schema operations (`+prop`, `xprop`, `uprop`) on the same database now execute sequentially to avoid race conditions, using the same chaining mechanism as consecutive moves.
 - **Expanded tool docstrings** — `notion.read` and `notion.apply` docstrings updated with table operations, relative date filter examples, typed refs, and clearer parameter descriptions.
 
-### 2026-02-17
+### v0.0.3 — 2026-02-17
 
 - **Database creation and management** — `+db` creates databases with typed property definitions, `+prop` adds properties, `xprop` deletes properties, and `uprop` renames properties. Property definitions use a compact `Name(type: config)` syntax supporting select options, number formats, relation targets, and dual relations.
 - **Full table support** — tables are no longer opaque placeholders. They render as pipe-delimited rows (`| cell | cell |`) with full read/write roundtrip. Consecutive table rows auto-group into a table parent, and Markdown separator rows are silently dropped.
@@ -156,9 +156,7 @@ codex mcp add dauphin-notion-mcp -- uvx --refresh --from git+https://github.com/
 - **Improved `!`-prefix disambiguation** — callout, opaque, and structural blocks all start with `!` and are now disambiguated in a clear priority order: colored callouts → opaque (`!type~`) → structural (`!type N`) → default callout.
 - **Auto-refresh install** — the recommended `uvx` config now includes `--refresh` so Claude Code always uses the latest version.
 
-### 2026-02-14
-
-Major new features:
+### v0.0.2 — 2026-02-14
 
 - **Better searching and filtering over databases** — `notion_read` now accepts `filter`, `sort`, and `columns` parameters. The filter DSL supports comparison operators (`=`, `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=`), unary checks (`?` empty, `!?` not empty), boolean logic (`&`, `|`), parenthesized grouping, quoted property names, and relative dates (`-14d`). Sort takes compact specs like `Due desc, Status asc`. Columns selects which properties to return (`Name, Status, Due`). Schema-aware compilation validates property names and coerces types.
 - **Parallel reads** — each entry in the `pages` list can now override `depth`, `limit`, `filter`, `sort`, and `columns` independently, enabling batch reads that mix pages and filtered databases in a single call.
